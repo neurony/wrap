@@ -260,11 +260,7 @@ fn shell_join_local(args: &[String]) -> String {
 
 async fn exec_sh(sandbox: &Sandbox, script: &str) -> Result<u8> {
     let output = sandbox
-        .exec_with("/bin/sh", |e| {
-            e.args(["-c", script])
-                .cwd(WORKSPACE)
-                .timeout(std::time::Duration::from_secs(30))
-        })
+        .exec_with("/bin/sh", |e| e.args(["-c", script]).cwd(WORKSPACE))
         .await
         .context("wrap method")?;
     std::io::Write::write_all(&mut std::io::stdout(), output.stdout_bytes())?;

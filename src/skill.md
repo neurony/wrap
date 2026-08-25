@@ -93,8 +93,9 @@ Prints `fully attached` and owns the TTY. Use that when the user should see the 
 
 ## Config
 
-`resources/default.yml` is the strict base configuration. `$XDG_CONFIG_HOME/wrap/config.yml` (`~/.config/wrap/config.yml`) contains only local overrides. Mappings merge recursively; `agents`, `secrets`, and `layers` merge by `name`, `env`, and `id`. An explicit empty keyed list clears that default list. Other lists replace their defaults. Unknown and former keys are errors.
+`resources/default.yml` is the strict base configuration. Exactly one user overlay is applied, first match wins: `--config` / `WRAP_CONFIG`, else `$HERMES_HOME/wrap.yml`, else `$XDG_CONFIG_HOME/wrap/config.yml`. A Hermes profile `wrap.yml` replaces the XDG global; it does not merge with it. Copy the global file into the profile to start from it. Mappings merge recursively onto the embedded defaults; `agents`, `secrets`, and `layers` merge by `name`, `env`, and `id`. An explicit empty keyed list clears that default list. Other lists replace their defaults. Unknown and former keys are errors.
 
+- `workspace` is the host directory mounted at `/workspace`. Used when `-c` is omitted. `~` expands.
 - `build` sets `cpus`, initial `memory`, and `memory_max` in MiB.
 - `env` sets guest environment variables.
 - Every secret names its guest `env`, a required `host-env`, and its permitted `hosts`. A `host-env` value is exactly one of `$(command)`, `$ENVIRONMENT`, or a literal string. Missing variables, failed commands, and empty results abort before VM work.

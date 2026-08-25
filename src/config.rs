@@ -15,6 +15,9 @@ const DEFAULT_YAML: &str = include_str!("../resources/default.yml");
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Host directory mounted at `/workspace`. `-c` still wins when set.
+    #[serde(default)]
+    pub workspace: Option<String>,
     #[serde(default)]
     pub build: BuildConfig,
     #[serde(default)]
@@ -127,16 +130,81 @@ pub fn config_path() -> PathBuf {
         .join("wrap/config.yml")
 }
 
+/// Where wrap looks for a user overlay. Exactly one overlay is used:
+/// `--config` / `WRAP_CONFIG`, else `$HERMES_HOME/wrap.yml`, else the
+/// XDG global file. A Hermes profile file replaces the global overlay;
+/// it does not merge with it. The chosen overlay still layers on the
+/// embedded defaults.
+#[derive(Debug, Clone)]
+pub struct ConfigPaths {
+    pub explicit: Option<PathBuf>,
+    pub hermes_home: Option<PathBuf>,
+    pub user_config: PathBuf,
+}
+
+impl ConfigPaths {
+    pub fn from_env() -> Self {
+        Self {
+            explicit: std::env::var_os("WRAP_CONFIG").map(PathBuf::from),
+            hermes_home: std::env::var_os("HERMES_HOME").map(PathBuf::from),
+            user_config: config_path(),
+        }
+    }
+
+    pub fn overlay(&self) -> Result<Option<PathBuf>> {
+        if let Some(path) = &self.explicit {
+            if !path.is_file() {
+                bail!("config {} does not exist", path.display());
+            }
+            return Ok(Some(path.clone()));
+        }
+        if let Some(home) = &self.hermes_home {
+            let path = home.join("wrap.yml");
+            if path.is_file() {
+                return Ok(Some(path));
+            }
+        }
+        if self.user_config.is_file() {
+            return Ok(Some(self.user_config.clone()));
+        }
+        Ok(None)
+    }
+}
+
 pub fn load() -> Result<Config> {
-    let path = config_path();
-    let cfg = if path.is_file() {
-        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        merge_config(&text).with_context(|| format!("parse {}", path.display()))?
-    } else {
-        merge_config("").context("parse embedded resources/default.yml")?
+    load_from(&ConfigPaths::from_env())
+}
+
+pub fn load_from(paths: &ConfigPaths) -> Result<Config> {
+    let overlay_path = paths.overlay()?;
+    let (overlay, source) = match &overlay_path {
+        Some(path) => (
+            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
+            path.display().to_string(),
+        ),
+        None => (String::new(), "embedded resources/default.yml".to_string()),
     };
+    let cfg = merge_config(&overlay).with_context(|| format!("parse {source}"))?;
     validate(&cfg)?;
     Ok(cfg)
+}
+
+pub fn resolve_workspace(
+    cli_target: Option<&Path>,
+    cfg: &Config,
+    cwd: &Path,
+    home: &Path,
+) -> Result<PathBuf> {
+    if let Some(path) = cli_target {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(workspace) = &cfg.workspace {
+        if workspace.trim().is_empty() {
+            bail!("workspace must not be empty");
+        }
+        return Ok(expand_tilde(workspace, home));
+    }
+    Ok(cwd.to_path_buf())
 }
 
 fn merge_config(overlay: &str) -> Result<Config> {
@@ -497,5 +565,150 @@ mod tests {
     fn empty_keyed_list_clears_default() {
         let cfg = merge_config("agents: []\n").unwrap();
         assert!(cfg.agents.is_empty());
+    }
+
+    #[test]
+    fn overlay_parses_workspace_hosts_and_secrets() {
+        let cfg = merge_config(
+            r#"
+workspace: ~/workspaces/qmd
+network:
+  allow_host:
+    - api.openai.com
+secrets:
+  - env: OPENAI_API_KEY
+    host-env: $OPENAI_API_KEY
+    hosts:
+      - api.openai.com
+"#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.workspace.as_deref(), Some("~/workspaces/qmd"));
+        assert!(
+            cfg.network
+                .allow_host
+                .iter()
+                .any(|host| host == "api.openai.com")
+        );
+        let openai = cfg
+            .secrets
+            .iter()
+            .find(|secret| secret.env == "OPENAI_API_KEY")
+            .expect("openai secret");
+        assert_eq!(openai.host_env, "$OPENAI_API_KEY");
+        assert_eq!(openai.hosts, vec!["api.openai.com"]);
+    }
+
+    #[test]
+    fn hermes_wrap_yml_replaces_user_global_overlay() {
+        let root = test_dir("replace-global");
+        let hermes_home = root.join("hermes");
+        let user_dir = root.join("xdg/wrap");
+        fs::create_dir_all(&hermes_home).unwrap();
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::write(
+            user_dir.join("config.yml"),
+            "workspace: /from/global\nsecrets:\n  - env: FROM_GLOBAL\n    host-env: literal-global\n",
+        )
+        .unwrap();
+        fs::write(
+            hermes_home.join("wrap.yml"),
+            "workspace: /from/profile\nsecrets:\n  - env: FROM_PROFILE\n    host-env: literal-profile\n",
+        )
+        .unwrap();
+
+        let cfg = load_from(&ConfigPaths {
+            explicit: None,
+            hermes_home: Some(hermes_home),
+            user_config: user_dir.join("config.yml"),
+        })
+        .unwrap();
+
+        assert_eq!(cfg.workspace.as_deref(), Some("/from/profile"));
+        assert!(
+            cfg.secrets
+                .iter()
+                .any(|secret| secret.env == "FROM_PROFILE")
+        );
+        assert!(
+            !cfg.secrets.iter().any(|secret| secret.env == "FROM_GLOBAL"),
+            "profile wrap.yml must replace the user global overlay, not merge with it"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn user_global_is_used_when_hermes_wrap_yml_is_absent() {
+        let root = test_dir("fallback-global");
+        let hermes_home = root.join("hermes");
+        let user_dir = root.join("xdg/wrap");
+        fs::create_dir_all(&hermes_home).unwrap();
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::write(user_dir.join("config.yml"), "workspace: /from/global\n").unwrap();
+
+        let cfg = load_from(&ConfigPaths {
+            explicit: None,
+            hermes_home: Some(hermes_home),
+            user_config: user_dir.join("config.yml"),
+        })
+        .unwrap();
+
+        assert_eq!(cfg.workspace.as_deref(), Some("/from/global"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_config_replaces_hermes_and_user() {
+        let root = test_dir("explicit");
+        let hermes_home = root.join("hermes");
+        let user_dir = root.join("xdg/wrap");
+        fs::create_dir_all(&hermes_home).unwrap();
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::write(hermes_home.join("wrap.yml"), "workspace: /from/profile\n").unwrap();
+        fs::write(user_dir.join("config.yml"), "workspace: /from/global\n").unwrap();
+        let explicit = root.join("wrap.yml");
+        fs::write(&explicit, "workspace: /from/explicit\n").unwrap();
+
+        let cfg = load_from(&ConfigPaths {
+            explicit: Some(explicit),
+            hermes_home: Some(hermes_home),
+            user_config: user_dir.join("config.yml"),
+        })
+        .unwrap();
+
+        assert_eq!(cfg.workspace.as_deref(), Some("/from/explicit"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_workspace_prefers_cli_then_config_then_cwd() {
+        let home = PathBuf::from("/home/tobi");
+        let cwd = PathBuf::from("/tmp/cwd");
+        let cfg = merge_config("workspace: ~/workspaces/qmd\n").unwrap();
+
+        assert_eq!(
+            resolve_workspace(Some(Path::new("/cli")), &cfg, &cwd, &home).unwrap(),
+            PathBuf::from("/cli")
+        );
+        assert_eq!(
+            resolve_workspace(None, &cfg, &cwd, &home).unwrap(),
+            home.join("workspaces/qmd")
+        );
+        let empty = merge_config("").unwrap();
+        assert_eq!(resolve_workspace(None, &empty, &cwd, &home).unwrap(), cwd);
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wrap-config-{}-{}-{label}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }

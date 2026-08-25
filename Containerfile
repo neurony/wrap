@@ -34,6 +34,15 @@ ENV MISE_DATA_DIR=/opt/mise/data \
     MISE_STATE_DIR=/tmp/.mise-state \
     MISE_TRUSTED_CONFIG_PATHS=/opt/mise/config
 
+# Defence-in-depth: rustup/cargo are NOT installed (see the mise tool list
+# below — rust was removed deliberately). These pins exist so that if anyone
+# adds a rust toolchain back, its ~1.5G lands under /opt instead of $HOME.
+# rustup ignores MISE_* and honours only its own two vars, which is exactly
+# how 1.5G ended up in /root and made this image unlaunchable under a runner
+# that tmpfs-mounts /root (see the /root guard at the end of this file).
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo
+
 ENV HOME=/root \
     USER=root \
     PATH=/usr/local/bin:/opt/mise/data/shims:/opt/wrap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -80,7 +89,6 @@ RUN printf '%s\n' 'Server = https://mirror.osbeck.com/archlinux/$repo/os/$arch' 
  && install -d /opt/mise /opt/wrap/bin /workspace /etc/wrap \
  && /usr/bin/mise self-update --yes || true \
  && /usr/bin/mise use --global --pin --yes --jobs 4 -- \
-      rust@latest \
       go@latest \
       bun@latest \
       node@latest \
@@ -177,7 +185,7 @@ RUN cat > /etc/wrap/skel.gitconfig <<'EOF'
 EOF
 
 RUN set -eu; \
-    for target in /root "${WRAP_USER_HOME}"; do \
+    for target in "${WRAP_USER_HOME}"; do \
       install -d "$target"; \
       cp /etc/wrap/skel.zshrc     "$target/.zshrc"; \
       cp /etc/wrap/skel.profile   "$target/.profile"; \
@@ -286,6 +294,34 @@ fi
 exec "$@"
 EOF
 RUN chmod 0755 /opt/wrap/bin/wrap-entrypoint
+
+# ---------------------------------------------------------------------------
+# Guard: /root must be EMPTY.
+#
+# Sandbox runners commonly mount a small tmpfs over /root (Hermes hardcodes
+# `--tmpfs /root:rw,exec,size=1g`). runc/crun honour tmpcopyup, i.e. they copy
+# the image's existing /root INTO that tmpfs at container init. If /root holds
+# more than the tmpfs size, init fails with a bare
+#   "tmpcopyup: ... no space left on device"  -> exit 126
+# and the container never starts. A 1.5G $HOME/.rustup made this image
+# unlaunchable under exactly that configuration.
+#
+# Nothing in this image is allowed to depend on $HOME: the toolchain lives at
+# absolute paths under /opt (see MISE_*/RUSTUP_HOME/CARGO_HOME above) and the
+# unprivileged user has its own /home/user. So /root should be empty, and we
+# assert it at build time rather than discovering a regression at runtime.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    rm -rf /root/.rustup /root/.cargo /root/.cache /root/.local /root/.config; \
+    rm -f  /root/.zshrc /root/.zprofile /root/.profile /root/.bashrc /root/.gitconfig; \
+    remaining="$(find /root -mindepth 1 -not -path '/root/.ssh' -not -path '/root/.ssh/*' -printf '%P\n' || true)"; \
+    if [ -n "$remaining" ]; then \
+      echo "FATAL: /root must be empty, found:" >&2; \
+      echo "$remaining" >&2; \
+      du -sh /root >&2; \
+      exit 1; \
+    fi; \
+    echo "OK: /root is empty ($(du -sh /root | cut -f1))"
 
 WORKDIR /workspace
 VOLUME ["/workspace"]

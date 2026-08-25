@@ -73,8 +73,35 @@ struct Cli {
     reset: bool,
 
     /// Host workspace whose wrap to target.
-    #[arg(short = 'c', long = "cwd")]
+    #[arg(short = 'p', long = "path", visible_alias = "cwd")]
     target: Option<std::path::PathBuf>,
+
+    /// Overlay config file. Replaces `$HERMES_HOME/wrap.yml` and the XDG global.
+    #[arg(short = 'c', long = "config")]
+    config: Option<std::path::PathBuf>,
+
+    /// Leave the VM running on exit instead of stopping it.
+    ///
+    /// Interactive `wrap` owns the VM lifecycle: it stops the sandbox when the
+    /// session ends. That is wrong for a long-lived driver (a Hermes terminal
+    /// backend, a CI step) that issues many independent commands against one
+    /// workspace — each call would pay a full boot. With `--keep` the VM is
+    /// created-or-resumed, the command runs, and the VM is left running for
+    /// the next call. Reap it explicitly with `--stop`.
+    #[arg(long)]
+    keep: bool,
+
+    /// Stop this workspace's VM and exit without running a command.
+    #[arg(long)]
+    stop: bool,
+
+    /// Wall-clock limit for the command, in seconds. 0 disables the limit.
+    ///
+    /// Applies to non-interactive runs only. On expiry wrap kills the guest
+    /// command and exits 124, matching coreutils `timeout`, so a caller can
+    /// distinguish a hung command from a failed one.
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<u64>,
 
     /// Print the wrap agent skill and exit.
     #[arg(long)]
@@ -122,21 +149,39 @@ async fn run() -> Result<u8> {
         return Ok(0);
     }
 
-    let cwd = match &cli.target {
-        Some(path) => path
-            .canonicalize()
-            .with_context(|| format!("realpath {}", path.display()))?,
-        None => std::env::current_dir().context("current directory")?,
+    let cfg = if let Some(path) = &cli.config {
+        let mut paths = config::ConfigPaths::from_env();
+        paths.explicit = Some(path.clone());
+        config::load_from(&paths)?
+    } else {
+        config::load()?
     };
+    let host_home = dirs::home_dir().context("home directory")?;
+    let process_cwd = std::env::current_dir().context("current directory")?;
+    let cwd = config::resolve_workspace(cli.target.as_deref(), &cfg, &process_cwd, &host_home)?;
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("realpath {}", cwd.display()))?;
+
+    if cli.stop {
+        // Explicit reaper for --keep sessions. Not an error if nothing is
+        // running: the postcondition (no VM for this workspace) already holds.
+        match Sandbox::get(&sandbox_name(&cwd)?).await {
+            Ok(existing) => {
+                let sandbox = resume_session(existing).await?;
+                sandbox.request_stop().await.context("stop session")?;
+            }
+            Err(_) => {}
+        }
+        return Ok(0);
+    }
 
     if let Some(method) = fast_method(cli.rebuild, cli.reset, &cli.command) {
         let sandbox = connect_existing(&cwd).await?;
         return methods::run_method(&sandbox, method).await;
     }
 
-    let cfg = config::load()?;
     let ui = Ui::stderr();
-    let host_home = dirs::home_dir().context("home directory")?;
     let secrets = config::resolve_secrets(&cfg)?;
     let host_copies = config::resolve_host_copies(&cfg, &host_home)?;
     let resources = vm_resources(&cli, &cfg)?;
@@ -170,9 +215,14 @@ async fn run() -> Result<u8> {
         .map(|secret| (secret.env.as_str(), secret.hosts.as_slice()))
         .collect();
     ui.secret_access(&secret_rows);
-    let code = enter_session(&ui, &cfg, &sandbox, &cli.command).await?;
-    if let Err(err) = sandbox.request_stop().await {
-        ui.stop_failed(&err);
+    let code = enter_session(&ui, &cfg, &sandbox, &cli.command, cli.timeout).await?;
+    // A driver issuing many commands against one workspace must not pay a boot
+    // per call, so --keep leaves the VM up for the next exec. Interactive use
+    // keeps the original own-the-lifecycle behaviour.
+    if !cli.keep {
+        if let Err(err) = sandbox.request_stop().await {
+            ui.stop_failed(&err);
+        }
     }
     Ok(code)
 }
@@ -911,8 +961,28 @@ fn apply_secrets(
     builder
 }
 
+/// Hosts the sandbox is allowed to reach: the explicit `network.allow_host`
+/// list plus every host any secret is scoped to.
+///
+/// Attaching a secret to a host IS a declaration of intent to talk to that
+/// host — the token is useless if the connection is refused. Folding the two
+/// together keeps the halves of the config from drifting: otherwise adding a
+/// secret for, say, api.openai.com yields a correctly-scoped token that
+/// `default_deny` then blocks, and the failure surfaces as an opaque network
+/// timeout rather than a policy error. `deny_host` is applied separately and
+/// still wins.
+fn allowed_hosts(cfg: &config::Config) -> Vec<String> {
+    let mut allow = cfg.network.allow_host.clone();
+    for secret in &cfg.secrets {
+        allow.extend(secret.hosts.iter().cloned());
+    }
+    allow.sort();
+    allow.dedup();
+    allow
+}
+
 fn session_policy(cfg: &config::Config) -> Result<NetworkPolicy, microsandbox::MicrosandboxError> {
-    let (allow_domains, allow_suffixes) = classify_hosts(&cfg.network.allow_host);
+    let (allow_domains, allow_suffixes) = classify_hosts(&allowed_hosts(cfg));
     let (deny_domains, deny_suffixes) = classify_hosts(&cfg.network.deny_host);
     let builder = if cfg.network.allow_everything {
         NetworkPolicy::builder().default_allow()
@@ -956,6 +1026,7 @@ async fn enter_session(
     cfg: &config::Config,
     sandbox: &Sandbox,
     command: &[String],
+    timeout_secs: Option<u64>,
 ) -> Result<u8> {
     if secrets_need_git_header(command) {
         let _ = sandbox
@@ -975,10 +1046,23 @@ async fn enter_session(
         return Ok(if code < 0 { 0 } else { code as u8 });
     }
 
-    let output = sandbox
-        .exec_with(&cmd, |e| e.args(args).cwd(WORKSPACE))
-        .await
-        .context("exec session")?;
+    let run = sandbox.exec_with(&cmd, |e| e.args(args).cwd(WORKSPACE));
+
+    // 0 means "no limit" — a caller that wants an unbounded run (a long build)
+    // shouldn't have to guess a big number.
+    let output = match timeout_secs.filter(|s| *s > 0) {
+        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), run).await {
+            Ok(result) => result.context("exec session")?,
+            // Exit 124 matches coreutils `timeout`, so callers can tell a hung
+            // command from a failed one without parsing stderr.
+            Err(_) => {
+                let _ = io::stderr()
+                    .write_all(format!("wrap: command timed out after {secs}s\n").as_bytes());
+                return Ok(124);
+            }
+        },
+        None => run.await.context("exec session")?,
+    };
     io::stdout().write_all(output.stdout_bytes())?;
     io::stderr().write_all(output.stderr_bytes())?;
     Ok(output.status().code as u8)
@@ -1122,6 +1206,81 @@ mod tests {
         let cfg: config::Config =
             serde_yaml::from_str(include_str!("../resources/default.yml")).unwrap();
         session_policy(&cfg).expect("session policy");
+    }
+
+    #[test]
+    fn secret_hosts_are_allowed_without_being_listed_twice() {
+        // A secret scoped to a host nobody put in network.allow_host. Before
+        // this was folded in, the token was minted correctly and then every
+        // connection to it was refused by default_deny.
+        let cfg: config::Config = serde_yaml::from_str(
+            "secrets:\n  - env: OPENAI_API_KEY\n    host-env: $OPENAI_API_KEY\n    hosts:\n      - api.openai.com\n\
+             network:\n  allow_host:\n    - mise.run\n",
+        )
+        .unwrap();
+
+        let allow = allowed_hosts(&cfg);
+        assert!(allow.contains(&"api.openai.com".to_string()));
+        assert!(allow.contains(&"mise.run".to_string()));
+        session_policy(&cfg).expect("session policy");
+    }
+
+    #[test]
+    fn allowed_hosts_dedupes_overlap() {
+        // default.yml lists the github domains in BOTH secrets.hosts and
+        // network.allow_host; the union must not double up.
+        let cfg: config::Config = serde_yaml::from_str(
+            "secrets:\n  - env: GITHUB_TOKEN\n    host-env: $GITHUB_TOKEN\n    hosts:\n      - \"*.github.com\"\n\
+             network:\n  allow_host:\n    - \"*.github.com\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(allowed_hosts(&cfg), vec!["*.github.com".to_string()]);
+    }
+
+    #[test]
+    fn secret_wildcard_hosts_classify_as_suffixes() {
+        // `*.foo` and `.foo` must both reach the policy as suffix rules,
+        // otherwise a wildcard secret host silently becomes an exact-match
+        // domain that never fires.
+        let cfg: config::Config = serde_yaml::from_str(
+            "secrets:\n  - env: T\n    host-env: $T\n    hosts:\n      - \"*.githubusercontent.com\"\n      - api.example.org\n",
+        )
+        .unwrap();
+
+        let (domains, suffixes) = classify_hosts(&allowed_hosts(&cfg));
+        assert_eq!(suffixes, vec![".githubusercontent.com".to_string()]);
+        assert_eq!(domains, vec!["api.example.org".to_string()]);
+    }
+
+    #[test]
+    fn allowed_hosts_is_empty_without_config() {
+        let cfg: config::Config = serde_yaml::from_str("{}").unwrap();
+        assert!(allowed_hosts(&cfg).is_empty());
+    }
+
+    #[test]
+    fn path_flag_wins_over_config_workspace() {
+        // Precedence for the backend: an explicit -p/--path beats the
+        // wrap.yml `workspace:` key, which in turn beats the process cwd.
+        let cfg: config::Config = serde_yaml::from_str("workspace: /from/config\n").unwrap();
+        let home = Path::new("/home/u");
+        let cwd = Path::new("/from/cwd");
+
+        assert_eq!(
+            config::resolve_workspace(Some(Path::new("/from/flag")), &cfg, cwd, home).unwrap(),
+            PathBuf::from("/from/flag")
+        );
+        assert_eq!(
+            config::resolve_workspace(None, &cfg, cwd, home).unwrap(),
+            PathBuf::from("/from/config")
+        );
+
+        let empty: config::Config = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(
+            config::resolve_workspace(None, &empty, cwd, home).unwrap(),
+            PathBuf::from("/from/cwd")
+        );
     }
 
     #[test]
