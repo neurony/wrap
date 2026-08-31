@@ -30,6 +30,9 @@ network:
     - mise.run 
     - .github.com
     - .githubusercontent.com
+    # GitHub's static assets (CSS/JS); without it github.com renders unstyled
+    # in the desktop image's browser.
+    - .githubassets.com
     - .jdx.dev
     - .pkgbuild.com
     # mise verifies GitHub artifact attestations for aqua tools via Sigstore.
