@@ -45,7 +45,9 @@ ENV WRAP_UID=1000 \
     WRAP_USER_NAME=user \
     WRAP_USER_HOME=/home/user
 
-RUN printf '%s\n' 'Server = https://mirror.osbeck.com/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist \
+# Arch's own geo mirror: it is what wrap's default network allowlist permits
+# (.pkgbuild.com), so `sudo pacman -S` keeps working inside the VM.
+RUN printf '%s\n' 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist \
  && pacman-key --init || true \
  && pacman-key --populate archlinux || true \
  && pacman -Sy --noconfirm archlinux-keyring \

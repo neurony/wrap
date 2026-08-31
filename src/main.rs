@@ -25,7 +25,6 @@ use sha2::{Digest, Sha256};
 use ui::{CrossingKind, Live, Ui};
 
 pub(crate) const WORKSPACE: &str = "/workspace";
-const IMAGE: &str = "ghcr.io/tobi/wrap:latest";
 const BASE_SNAPSHOT_PREFIX: &str = "wrap-image";
 const BASE_LAYOUT_LABEL: &str = "wrap.base-layout";
 const SESSION_MEMORY_MIN_MIB: u32 = 4096;
@@ -192,7 +191,10 @@ async fn connect_existing(cwd: &Path) -> Result<Sandbox> {
             cwd.display()
         )
     })?;
-    resume_session(existing).await
+    // Methods are short-lived processes that never request a stop; the VM
+    // must outlive them or the next method finds a ghost "running" row whose
+    // process died with us.
+    resume_session(existing, Resume::Detached).await
 }
 
 fn fast_method(rebuild: bool, reset: bool, command: &[String]) -> Option<methods::Method> {
@@ -221,7 +223,7 @@ fn build_stages(cfg: &config::Config) -> Result<Vec<BuildStage>> {
     );
 
     let mut lineage = Sha256::new();
-    lineage.update(IMAGE);
+    lineage.update(cfg.image.as_bytes());
     Ok(definitions
         .into_iter()
         .enumerate()
@@ -387,7 +389,7 @@ async fn build_layer(
         // registry's current `latest`, not a stale local tag. Always re-checks
         // the manifest and only fetches layers whose digests changed.
         builder
-            .image_with(|i| i.oci(IMAGE).root_disk(ROOT_DISK_GIB.gib()))
+            .image_with(|i| i.oci(cfg.image.as_str()).root_disk(ROOT_DISK_GIB.gib()))
             .pull_policy(PullPolicy::Always)
     };
     builder = apply_secrets(builder, secrets);
@@ -879,7 +881,7 @@ async fn open_or_create_session(
             live.phase("enforcing vm resources")?;
             let existing = enforce_session_resources(existing, resources).await?;
             live.phase("resuming vm")?;
-            let sandbox = match resume_session(existing).await {
+            let sandbox = match resume_session(existing, Resume::Attached).await {
                 Ok(sandbox) => sandbox,
                 Err(err) => {
                     live.fail("resume failed");
@@ -945,12 +947,41 @@ async fn enforce_session_resources(
         .with_context(|| format!("refresh session sandbox {name}"))
 }
 
-async fn resume_session(existing: SandboxHandle) -> Result<Sandbox> {
-    match existing.status_snapshot() {
-        SandboxStatus::Running | SandboxStatus::Draining | SandboxStatus::Paused => {
+/// How long to wait for a previous invocation's graceful shutdown to finish.
+const DRAIN_GRACE: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// The VM's runtime is owned by this process (sessions: we stop it on exit).
+    Attached,
+    /// The VM keeps running after this process exits (methods).
+    Detached,
+}
+
+async fn resume_session(existing: SandboxHandle, mode: Resume) -> Result<Sandbox> {
+    let existing = match existing.status_snapshot() {
+        // wrap requests a graceful stop and returns without waiting, so a
+        // follow-up invocation within a few seconds finds the previous VM
+        // still draining. Connecting to it yields a half-dead agent ("reader
+        // closed before response"); wait for it to settle and start fresh.
+        SandboxStatus::Draining => tokio::time::timeout(DRAIN_GRACE, async {
+            let _ = existing.wait_until_stopped().await;
+            existing.refresh().await
+        })
+        .await
+        .context("previous session did not finish shutting down")?
+        .context("refresh draining sandbox")?,
+        _ => existing,
+    };
+    match (existing.status_snapshot(), mode) {
+        (SandboxStatus::Running | SandboxStatus::Paused, _) => {
             existing.connect().await.context("connect existing sandbox")
         }
-        _ => existing.start().await.context("start existing sandbox"),
+        (_, Resume::Attached) => existing.start().await.context("start existing sandbox"),
+        (_, Resume::Detached) => existing
+            .start_detached()
+            .await
+            .context("start existing sandbox (detached)"),
     }
 }
 

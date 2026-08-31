@@ -1,4 +1,8 @@
 
+# Base image. `ghcr.io/tobi/wrap:desktop` adds XFCE on :1, Chrome with CDP and
+# agent-browser attached to it (see Containerfile.desktop).
+image: ghcr.io/tobi/wrap:latest
+
 build:
   cpus: 4
   memory: 4096

@@ -95,6 +95,7 @@ Prints `fully attached` and owns the TTY. Use that when the user should see the 
 
 `resources/default.yml` is the strict base configuration. `$XDG_CONFIG_HOME/wrap/config.yml` (`~/.config/wrap/config.yml`) contains only local overrides. Mappings merge recursively; `agents`, `secrets`, and `layers` merge by `name`, `env`, and `id`. An explicit empty keyed list clears that default list. Other lists replace their defaults. Unknown and former keys are errors.
 
+- `image` selects the OCI base image (default `ghcr.io/tobi/wrap:latest`; `ghcr.io/tobi/wrap:desktop` adds an XFCE desktop, Chrome with CDP, and agent-browser attached to it). Each image gets its own base snapshot chain.
 - `build` sets `cpus`, initial `memory`, and `memory_max` in MiB.
 - `env` sets guest environment variables.
 - Every secret names its guest `env`, a required `host-env`, and its permitted `hosts`. A `host-env` value is exactly one of `$(command)`, `$ENVIRONMENT`, or a literal string. Missing variables, failed commands, and empty results abort before VM work.

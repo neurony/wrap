@@ -15,6 +15,9 @@ const DEFAULT_YAML: &str = include_str!("../resources/default.yml");
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// OCI image the shared base snapshot is built from.
+    #[serde(default = "default_image")]
+    pub image: String,
     #[serde(default)]
     pub build: BuildConfig,
     #[serde(default)]
@@ -107,6 +110,10 @@ pub struct ResolvedHostCopy {
     pub agent: String,
     pub host: PathBuf,
     pub guest: String,
+}
+
+fn default_image() -> String {
+    "ghcr.io/tobi/wrap:latest".to_string()
 }
 
 fn default_cpus() -> u8 {
@@ -443,8 +450,16 @@ mod tests {
 
     #[test]
     fn rejects_legacy_and_unknown_keys() {
-        let err = serde_yaml::from_str::<Config>("image: archlinux\n").unwrap_err();
-        assert!(err.to_string().contains("unknown field `image`"));
+        let err = serde_yaml::from_str::<Config>("base_image: archlinux\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field `base_image`"));
+    }
+
+    #[test]
+    fn image_is_selectable_with_a_default() {
+        let cfg: Config = serde_yaml::from_str(DEFAULT_YAML).unwrap();
+        assert_eq!(cfg.image, "ghcr.io/tobi/wrap:latest");
+        let cfg: Config = serde_yaml::from_str("image: ghcr.io/tobi/wrap:desktop\n").unwrap();
+        assert_eq!(cfg.image, "ghcr.io/tobi/wrap:desktop");
     }
 
     #[test]
