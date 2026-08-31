@@ -15,11 +15,11 @@ FROM archlinux:latest
 # Pinning MISE_* to absolute paths decouples the toolchain from $HOME entirely,
 # so HOME is free to be whatever the caller wants.
 #
-# DATA/CONFIG are read-only shared state under /opt (world-readable).
-# CACHE/STATE are runtime-WRITABLE and therefore must NOT live under /opt:
-# a non-root uid cannot create dirs there, and mise then fails to resolve tool
-# bin paths. /tmp is world-writable + sticky, so every uid gets a usable cache
-# regardless of who runs the container or what HOME is set to.
+# DATA/CONFIG are shared state under /opt, owned by `user` (installs work
+# without sudo) and world-readable (root can still run the shims).
+# CACHE/STATE deliberately stay at mise's per-user defaults ($HOME/.cache/mise,
+# $HOME/.local/state/mise). A shared cache dir (e.g. under /tmp) ends up owned
+# by whichever uid touched it first and then breaks mise for every other uid.
 #
 # MISE_TRUSTED_CONFIG_PATHS is required, not cosmetic: mise only auto-trusts a
 # global config it resolves through $HOME. With the config at an absolute path
@@ -30,8 +30,6 @@ FROM archlinux:latest
 # ---------------------------------------------------------------------------
 ENV MISE_DATA_DIR=/opt/mise/data \
     MISE_CONFIG_DIR=/opt/mise/config \
-    MISE_CACHE_DIR=/tmp/.mise-cache \
-    MISE_STATE_DIR=/tmp/.mise-state \
     MISE_TRUSTED_CONFIG_PATHS=/opt/mise/config
 
 # Build-time identity only; the runtime identity is set at the end of the file.
@@ -90,7 +88,7 @@ RUN printf '%s\n' 'Server = https://mirror.osbeck.com/archlinux/$repo/os/$arch' 
  && if ! grep -qx '/bin/zsh' /etc/shells; then echo /bin/zsh >> /etc/shells; fi \
  && if ! grep -qx '/usr/bin/zsh' /etc/shells; then echo /usr/bin/zsh >> /etc/shells; fi \
  && (chsh -s /bin/zsh root || true) \
- && rm -rf /var/cache/pacman/pkg/* /root/.cache /tmp/.mise-cache /tmp/.mise-state \
+ && rm -rf /var/cache/pacman/pkg/* /root/.cache /root/.local/state/mise \
  && chmod -R a+rX /opt/mise /opt/wrap \
  && find /opt/mise/data/shims -type f -exec chmod a+rx {} + 2>/dev/null || true
 
@@ -116,27 +114,23 @@ RUN groupadd -g "${WRAP_GID}" "${WRAP_USER_NAME}" 2>/dev/null || true \
 
 # ---------------------------------------------------------------------------
 # Shell environment. MISE_* and PATH are re-exported here so they survive
-# `su`, `sudo -i`, and login shells that reset the environment.
-# CACHE/STATE use ${VAR:-default} so a caller can still redirect them.
+# `su`, `sudo -i`, and login shells that reset the environment. One file,
+# sourced by /etc/profile (sh/bash login) and /etc/zsh/zshenv (every zsh).
+# The PATH prepend is idempotent so nested shells do not stack duplicates.
 # ---------------------------------------------------------------------------
 RUN cat > /etc/profile.d/wrap.sh <<'EOF'
 export MISE_DATA_DIR=/opt/mise/data
 export MISE_CONFIG_DIR=/opt/mise/config
-export MISE_CACHE_DIR=${MISE_CACHE_DIR:-/tmp/.mise-cache}
-export MISE_STATE_DIR=${MISE_STATE_DIR:-/tmp/.mise-state}
-export MISE_TRUSTED_CONFIG_PATHS=${MISE_TRUSTED_CONFIG_PATHS:-/opt/mise/config}
-export PATH="/usr/local/bin:/opt/mise/data/shims:/opt/wrap/bin:$PATH"
+export MISE_TRUSTED_CONFIG_PATHS="${MISE_TRUSTED_CONFIG_PATHS:-/opt/mise/config}"
 export STARSHIP_CONFIG=/etc/wrap/starship.toml
+case ":$PATH:" in
+  *":/opt/mise/data/shims:"*) ;;
+  *) export PATH="/usr/local/bin:/opt/mise/data/shims:/opt/wrap/bin:$PATH" ;;
+esac
 EOF
 
 RUN cat > /etc/zsh/zshenv <<'EOF'
-export MISE_DATA_DIR=/opt/mise/data
-export MISE_CONFIG_DIR=/opt/mise/config
-export MISE_CACHE_DIR=${MISE_CACHE_DIR:-/tmp/.mise-cache}
-export MISE_STATE_DIR=${MISE_STATE_DIR:-/tmp/.mise-state}
-export MISE_TRUSTED_CONFIG_PATHS=${MISE_TRUSTED_CONFIG_PATHS:-/opt/mise/config}
-export PATH="/usr/local/bin:/opt/mise/data/shims:/opt/wrap/bin:$PATH"
-export STARSHIP_CONFIG=/etc/wrap/starship.toml
+[ -f /etc/profile.d/wrap.sh ] && . /etc/profile.d/wrap.sh
 if [[ -o interactive && -t 1 ]]; then
   eval "$(/usr/bin/mise activate zsh)"
   eval "$(starship init zsh)"
