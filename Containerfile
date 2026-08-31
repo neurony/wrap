@@ -34,6 +34,7 @@ ENV MISE_DATA_DIR=/opt/mise/data \
     MISE_STATE_DIR=/tmp/.mise-state \
     MISE_TRUSTED_CONFIG_PATHS=/opt/mise/config
 
+# Build-time identity only; the runtime identity is set at the end of the file.
 ENV HOME=/root \
     USER=root \
     PATH=/usr/local/bin:/opt/mise/data/shims:/opt/wrap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -97,6 +98,9 @@ RUN printf '%s\n' 'Server = https://mirror.osbeck.com/archlinux/$repo/os/$arch' 
 # Unprivileged `user` (uid/gid 1000) with passwordless sudo.
 # /workspace is owned by that uid so the default bind-mount target is writable
 # in user mode without any host-side chown.
+# /opt/mise is owned by that uid too: the toolchain lives at a HOME-independent
+# path, but `user` must be able to `mise use`/`mise install` into it without
+# sudo. root still reads it fine (a+rX).
 # ---------------------------------------------------------------------------
 RUN groupadd -g "${WRAP_GID}" "${WRAP_USER_NAME}" 2>/dev/null || true \
  && useradd -m -d "${WRAP_USER_HOME}" -u "${WRAP_UID}" -g "${WRAP_GID}" \
@@ -107,7 +111,7 @@ RUN groupadd -g "${WRAP_GID}" "${WRAP_USER_NAME}" 2>/dev/null || true \
  && printf '%%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/11-wrap-wheel \
  && chmod 0440 /etc/sudoers.d/10-wrap-user /etc/sudoers.d/11-wrap-wheel \
  && visudo -c \
- && chown -R "${WRAP_UID}:${WRAP_GID}" "${WRAP_USER_HOME}" /workspace \
+ && chown -R "${WRAP_UID}:${WRAP_GID}" "${WRAP_USER_HOME}" /workspace /opt/mise \
  && chmod 0755 "${WRAP_USER_HOME}"
 
 # ---------------------------------------------------------------------------
@@ -237,57 +241,44 @@ format = "[· $duration](#78909c)"
 EOF
 
 # ---------------------------------------------------------------------------
-# Entrypoint: optional user mode.
+# Entrypoint: the workload always runs as the unprivileged `user`.
 #
-#   default                      -> root (backwards compatible)
-#   -e WRAP_MODE=user            -> drops to uid/gid 1000 with HOME=/home/user
-#   --user 1000:1000             -> also works directly; HOME is corrected
-#                                   because a bare --user leaves HOME=/root,
-#                                   which uid 1000 cannot write.
+#   default / started as root   -> setpriv to uid/gid 1000, HOME=/home/user
+#   --user <uid>                -> runs as that uid; HOME is corrected because
+#                                  a bare --user would otherwise inherit an
+#                                  unusable HOME.
 #
-# BIND MOUNTS + ROOTLESS PODMAN: under rootless podman, container uid 0 maps to
-# the host user while container uid 1000 maps into the *subuid* range, so a
-# plain `-e WRAP_MODE=user` cannot write a host directory owned by that user.
-# For a writable host bind mount, either
-#   - run rootless podman WITHOUT WRAP_MODE (container root == host user), or
-#   - pass `--userns=keep-id` (container uid == host uid; the entrypoint still
-#     fixes HOME automatically).
-# Under docker or rootful podman, WRAP_MODE=user writes as host uid 1000
-# directly.
+# There is no root mode. Need root inside? `sudo -i` (passwordless) or
+# `docker exec -u root`.
+#
+# BIND MOUNTS + ROOTLESS PODMAN: container uid 1000 maps into the *subuid*
+# range, so a host directory owned by the host user is not writable from the
+# default identity. Pass `--userns=keep-id` (container uid == host uid).
+# Under docker or rootful podman, uid 1000 writes as host uid 1000 directly.
 # ---------------------------------------------------------------------------
 RUN cat > /opt/wrap/bin/wrap-entrypoint <<'EOF'
 #!/bin/sh
 set -eu
 
-: "${WRAP_MODE:=root}"
 : "${WRAP_USER_NAME:=user}"
 : "${WRAP_USER_HOME:=/home/user}"
 : "${WRAP_UID:=1000}"
 : "${WRAP_GID:=1000}"
 
-current_uid="$(id -u)"
+export HOME="$WRAP_USER_HOME"
+export USER="$WRAP_USER_NAME"
 
-# A bare `--user 1000` inherits HOME=/root from the image env, which uid 1000
-# cannot read (0750). Point HOME at a directory this uid actually owns.
-if [ "$current_uid" != "0" ] && [ "${HOME:-/root}" = "/root" ]; then
-  HOME="$WRAP_USER_HOME"
-  export HOME
-  USER="$WRAP_USER_NAME"
-  export USER
-fi
-
-# Explicit user mode: only meaningful when we start as root.
-if [ "$WRAP_MODE" = "user" ] && [ "$current_uid" = "0" ]; then
-  export HOME="$WRAP_USER_HOME"
-  export USER="$WRAP_USER_NAME"
+if [ "$(id -u)" = "0" ]; then
   exec setpriv --reuid="$WRAP_UID" --regid="$WRAP_GID" --init-groups -- "$@"
 fi
-
 exec "$@"
 EOF
 RUN chmod 0755 /opt/wrap/bin/wrap-entrypoint
 
+# Image defaults describe the identity the workload actually runs as.
+ENV HOME=/home/user \
+    USER=user
+
 WORKDIR /workspace
-VOLUME ["/workspace"]
 ENTRYPOINT ["/opt/wrap/bin/wrap-entrypoint"]
 CMD ["/bin/zsh", "-l"]

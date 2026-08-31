@@ -246,7 +246,8 @@ fn find_script(args: &[String]) -> String {
 
 fn bash_script(script: &str) -> String {
     format!(
-        r#"export PATH="/root/.local/bin:/root/.local/share/mise/shims:$PATH"; {}"#,
+        r#"export PATH="{}:$PATH"; {}"#,
+        crate::GUEST_PATH_PREFIX,
         script
     )
 }

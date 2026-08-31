@@ -99,8 +99,12 @@ Prints `fully attached` and owns the TTY. Use that when the user should see the 
 - `env` sets guest environment variables.
 - Every secret names its guest `env`, a required `host-env`, and its permitted `hosts`. A `host-env` value is exactly one of `$(command)`, `$ENVIRONMENT`, or a literal string. Missing variables, failed commands, and empty results abort before VM work.
 - Agent packages accept `mise:<tool>@<version>` and GitHub source locators such as `github:<owner>/<repo>@<version>`. wrap resolves known source aliases to their working mise backend (`github:tobi/try` uses `gem:try-cli`), installs and pins packages in the shared agent layer, activates mise in guest shells, and creates agent shims automatically.
-- `host-copy` accepts the same host-value forms. For a new directory-specific VM, host state is imported before shims or the entry announcement and never enters a shared snapshot. `guest` overrides the default `/root/<source-name>` destination.
-- `layers` contains only custom cached shell scripts. Layer snapshot names include cumulative content digests, so changing a package, built-in setup, or layer script rebuilds that layer and its descendants while retaining reusable parents.
+- `host-copy` accepts the same host-value forms. For a new directory-specific VM, host state is imported before shims or the entry announcement and never enters a shared snapshot. `guest` overrides the default `/home/user/<source-name>` destination. Imported state is owned by the session user.
+- `layers` contains only custom cached shell scripts. They run as `user` at build time (use `sudo` for system packages) with mise pointed at the shared, user-owned `/opt/mise` tree; `mise use -g <tool>` there is what the session sees.
+
+## Guest identity
+
+Everything runs as the unprivileged `user` account (`HOME=/home/user`, passwordless `sudo`): build layers, agent installs, and sessions. Only wrap's own session plumbing (host-copy staging, shims, uid realignment) runs as root. At VM creation, `user`'s uid/gid are realigned to the host owner of the workspace, and `/workspace` exposes literal host ownership, so the mount is writable without chowning host files. If wrap itself is run as root, the guest stays root. Layer snapshot names include cumulative content digests, so changing a package, built-in setup, or layer script rebuilds that layer and its descendants while retaining reusable parents.
 
 ## Network
 

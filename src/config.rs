@@ -350,7 +350,7 @@ pub fn resolve_host_copies(cfg: &Config, home: &Path) -> Result<Vec<ResolvedHost
                     .with_context(|| {
                         format!("derive guest path from host-copy {}", host.display())
                     })?;
-                format!("/root/{name}")
+                format!("{}/{name}", crate::GUEST_HOME)
             }
         };
         copies.push(ResolvedHostCopy {

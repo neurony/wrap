@@ -28,6 +28,8 @@ network:
     - .githubusercontent.com
     - .jdx.dev
     - .pkgbuild.com
+    # mise verifies GitHub artifact attestations for aqua tools via Sigstore.
+    - .sigstore.dev
 
   # deny_host:
   #   - example.com
@@ -49,7 +51,6 @@ agents:
       ~/.claude
   - name: claude
     package: mise:claude@latest
-    guest: /root/.pi
   - name: try
     package: github:tobi/try@latest
 

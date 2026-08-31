@@ -115,6 +115,26 @@ wrap -c "$PWD" read src/main.rs:40-80
 wrap -c "$PWD" read src/main.rs:40:10
 ```
 
+## Guest user
+
+Everything runs as the unprivileged `user` account inside the VM (`HOME=/home/user`), with passwordless `sudo` for the cases that need it; the container images have no root mode either. Only wrap's own setup plumbing runs as root. The guest `user` is realigned to the uid/gid that owns your project directory on the host, so `/workspace` is writable without any chowning and files created in the VM come back owned by you.
+
+Agent configuration copied from the host (`~/.pi`, `~/.omp`, ...) lands under `/home/user`.
+
+## Desktop image
+
+`ghcr.io/tobi/wrap:desktop` (`Containerfile.desktop`) layers a headless desktop on the base image:
+
+- X display `:1` (Xvfb, 1920x1080) running XFCE, autostarted from login shells; `wrap-desktop start|stop|status|url`.
+- One persistent Google Chrome window on that desktop with CDP on `127.0.0.1:9222`. The setup speedrun is baked in system-wide: managed policies (`/etc/opt/chrome/policies/managed`) and `initial_preferences` disable sign-in, sync, default-browser, privacy-sandbox, promo, password/autofill and keyring prompts, so neither agents nor humans ever see first-run UI.
+- `agent-browser` preinstalled and preconfigured (`~/.agent-browser/config.json`, `cdp: 9222`) to attach to that Chrome: `agent-browser open https://example.com` acts in the same browser you see over VNC, so you can watch, log in, or take over and hand back. A project `./agent-browser.json` still overrides (drop `cdp` for an isolated headed Chrome).
+- View it over VNC `127.0.0.1:5900` (no password) or noVNC `http://127.0.0.1:6080/vnc.html`. All listeners bind localhost inside the guest; reach them through the VM's port forwarding.
+
+```bash
+docker run -d --network host ghcr.io/tobi/wrap:desktop         # desktop + chrome, localhost ports
+docker run -it ghcr.io/tobi/wrap:desktop                       # shell as `user`; desktop autostarts
+```
+
 ## Network and credentials
 
 The VM starts with a default-deny network policy. Project traffic is limited to the configured allowlist, which includes GitHub by default. Custom layers and agents are applied after the published base container is loaded.

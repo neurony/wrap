@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use microsandbox::{
     ExecEvent, NetworkPolicy, NetworkProfile, Sandbox, Snapshot,
-    sandbox::{SandboxHandle, SandboxStatus},
+    sandbox::{SandboxHandle, SandboxStatus, StatVirtualization},
     size::SizeExt,
 };
 use sha2::{Digest, Sha256};
@@ -30,6 +30,18 @@ const BASE_SNAPSHOT_PREFIX: &str = "wrap-image";
 const BASE_LAYOUT_LABEL: &str = "wrap.base-layout";
 const SESSION_MEMORY_MIN_MIB: u32 = 4096;
 const ROOT_DISK_GIB: u32 = 16;
+/// Unprivileged guest identity baked into the image (passwordless sudo).
+/// Sessions run as this user; only build layers and session plumbing run as
+/// root. The uid/gid are realigned to the workspace owner at session creation
+/// so the virtiofs bind mount is writable without chowning anything.
+pub(crate) const GUEST_USER: &str = "user";
+pub(crate) const GUEST_HOME: &str = "/home/user";
+const GUEST_ROOT: &str = "root";
+/// Toolchain lives at absolute paths outside any $HOME (see Containerfile).
+const MISE_DATA_DIR: &str = "/opt/mise/data";
+const MISE_CONFIG_DIR: &str = "/opt/mise/config";
+pub(crate) const GUEST_PATH_PREFIX: &str =
+    "/usr/local/bin:$HOME/.local/bin:/opt/mise/data/shims:/opt/wrap/bin";
 static HOST_COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser, Debug)]
@@ -215,16 +227,15 @@ fn build_stages(cfg: &config::Config) -> Result<Vec<BuildStage>> {
 }
 
 fn mise_agents_script(agents: &[config::AgentSpec]) -> Result<String> {
-    let mut script = build_script("mise use --global --pin --yes --jobs 4 --");
+    let mut body = String::from("mise use --global --pin --yes --jobs 4 --");
     let mut seen = std::collections::BTreeSet::new();
     for agent in agents {
         let package = mise_install_package(&agent.package)?;
         if seen.insert(package.clone()) {
-            push_shell_arg(&mut script, &package);
+            push_shell_arg(&mut body, &package);
         }
     }
-    script.push('\n');
-    Ok(script)
+    Ok(build_script(&body))
 }
 
 fn mise_install_package(package: &str) -> Result<String> {
@@ -242,11 +253,23 @@ fn mise_install_package(package: &str) -> Result<String> {
     })
 }
 
+/// Build layers run as the same unprivileged `user` the session will run as,
+/// with passwordless sudo for system packages. mise is pointed at the shared
+/// /opt tree (user-owned in the image) so tools installed here are what the
+/// session sees, and `user` can keep installing into it at runtime.
+///
+/// The guarded chown is a transition aid for base images that still ship
+/// /opt/mise root-owned; it is a no-op on current images.
 fn build_script(body: &str) -> String {
     format!(
-        "set -eu\nexport HOME=/root\nexport USER=root\n\
-         export PATH=\"/root/.local/bin:/root/.local/share/mise/shims:\
-         /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n{body}"
+        "set -eu\nexport HOME={GUEST_HOME}\nexport USER={GUEST_USER}\n\
+         export MISE_DATA_DIR={MISE_DATA_DIR}\nexport MISE_CONFIG_DIR={MISE_CONFIG_DIR}\n\
+         export MISE_TRUSTED_CONFIG_PATHS={MISE_CONFIG_DIR}\n\
+         export MISE_CACHE_DIR={GUEST_HOME}/.cache/mise\nexport MISE_STATE_DIR={GUEST_HOME}/.local/state/mise\n\
+         export PATH=\"/usr/local/bin:{MISE_DATA_DIR}/shims:/opt/wrap/bin:\
+         /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n\
+         [ -O {MISE_DATA_DIR} ] || sudo -n chown -R \"$(id -u):$(id -g)\" /opt/mise\n\
+         {body}\n"
     )
 }
 
@@ -319,6 +342,9 @@ async fn build_layer(
         .memory(cfg.build.memory)
         .max_memory(cfg.build.memory_max)
         .shell("/bin/bash")
+        .user(GUEST_USER)
+        .env("HOME", GUEST_HOME)
+        .env("USER", GUEST_USER)
         .replace()
         .network(|n| n.policy(NetworkPolicy::from_profiles([NetworkProfile::Public])));
     builder = if let Some(snapshot) = parent {
@@ -483,13 +509,12 @@ async fn apply_session_config(
             return Err(err);
         }
         let marker = marker.as_deref().unwrap();
-        let output = sandbox
-            .shell(format!(
-                "mkdir -p /var/lib/wrap && : > {}",
-                shell_quote(marker)
-            ))
-            .await
-            .context("mark imported host state")?;
+        let output = root_shell(
+            sandbox,
+            format!("mkdir -p /var/lib/wrap && : > {}", shell_quote(marker)),
+        )
+        .await
+        .context("mark imported host state")?;
         if !output.status().success {
             live.fail("host copy marker failed");
             bail!("mark imported host state failed");
@@ -524,13 +549,23 @@ fn host_copy_marker(copies: &[config::ResolvedHostCopy]) -> Option<String> {
     ))
 }
 
-async fn copy_host_state(sandbox: &Sandbox, copies: &[config::ResolvedHostCopy]) -> Result<()> {
-    let cleanup = sandbox
-        .shell(
-            "set -eu\nmkdir -p /var/lib/wrap\nrm -f /tmp/.wrap-host-copy.tar /var/lib/wrap/.host-copy.tar\n",
-        )
+/// Run a script as guest root regardless of the sandbox's default user.
+async fn root_shell(
+    sandbox: &Sandbox,
+    script: impl Into<String>,
+) -> microsandbox::MicrosandboxResult<microsandbox::ExecOutput> {
+    sandbox
+        .shell_with(script, |e| e.user(GUEST_ROOT).env("HOME", "/root"))
         .await
-        .context("prepare host-copy staging")?;
+}
+
+async fn copy_host_state(sandbox: &Sandbox, copies: &[config::ResolvedHostCopy]) -> Result<()> {
+    let cleanup = root_shell(
+        sandbox,
+        "set -eu\nmkdir -p /var/lib/wrap\nrm -f /tmp/.wrap-host-copy.tar /var/lib/wrap/.host-copy.tar\n",
+    )
+    .await
+    .context("prepare host-copy staging")?;
     if !cleanup.status().success {
         let stderr = String::from_utf8_lossy(cleanup.stderr_bytes());
         bail!("prepare host-copy staging failed: {}", stderr.trim());
@@ -540,8 +575,7 @@ async fn copy_host_state(sandbox: &Sandbox, copies: &[config::ResolvedHostCopy])
             .parent()
             .and_then(Path::to_str)
             .context("host-copy guest path has no parent")?;
-        let mkdir = sandbox
-            .shell(format!("mkdir -p {}", shell_quote(parent)))
+        let mkdir = root_shell(sandbox, format!("mkdir -p {}", shell_quote(parent)))
             .await
             .with_context(|| format!("prepare agent {} host-copy", copy.agent))?;
         if !mkdir.status().success {
@@ -554,6 +588,12 @@ async fn copy_host_state(sandbox: &Sandbox, copies: &[config::ResolvedHostCopy])
                 .copy_from_host(&copy.host, &copy.guest)
                 .await
                 .with_context(|| format!("copy agent {} host file", copy.agent))?;
+            let chown = root_shell(sandbox, chown_to_guest_user(&copy.guest))
+                .await
+                .with_context(|| format!("chown agent {} host file", copy.agent))?;
+            if !chown.status().success {
+                bail!("chown agent {} host file failed", copy.agent);
+            }
             continue;
         }
         if !copy.host.is_dir() {
@@ -598,12 +638,12 @@ async fn copy_host_state(sandbox: &Sandbox, copies: &[config::ResolvedHostCopy])
             .await
             .with_context(|| format!("transfer agent {} host-copy", copy.agent))?;
         let script = format!(
-            "set -eu\nrm -rf {guest}\nmkdir -p {guest}\ntar -xf {archive} -C {guest}\nrm -f {archive}\n",
+            "set -eu\nrm -rf {guest}\nmkdir -p {guest}\ntar -xf {archive} -C {guest}\nrm -f {archive}\n{chown}",
             guest = shell_quote(&copy.guest),
             archive = shell_quote(&guest_archive),
+            chown = chown_to_guest_user(&copy.guest),
         );
-        let output = sandbox
-            .shell(script)
+        let output = root_shell(sandbox, script)
             .await
             .with_context(|| format!("extract agent {} host-copy", copy.agent))?;
         if !output.status().success {
@@ -617,6 +657,30 @@ async fn copy_host_state(sandbox: &Sandbox, copies: &[config::ResolvedHostCopy])
         }
     }
     Ok(())
+}
+
+/// Imported host state and its parents (up to, not including, `/`) must be
+/// traversable and owned by the session user; agentd copies files in as root.
+fn chown_to_guest_user(guest: &str) -> String {
+    let mut script = format!(
+        "chown -R {GUEST_USER}:{GUEST_USER} {}\n",
+        shell_quote(guest)
+    );
+    let mut dir = Path::new(guest).parent();
+    while let Some(parent) = dir {
+        if parent == Path::new("/") || parent == Path::new(GUEST_HOME) {
+            break;
+        }
+        if !parent.starts_with(GUEST_HOME) {
+            break;
+        }
+        script.push_str(&format!(
+            "chown {GUEST_USER}:{GUEST_USER} {}\n",
+            shell_quote(&parent.to_string_lossy())
+        ));
+        dir = parent.parent();
+    }
+    script
 }
 
 struct TempArchive(PathBuf);
@@ -640,7 +704,14 @@ async fn install_agent_shims(sandbox: &Sandbox, cfg: &config::Config) -> Result<
             bail!("invalid agent shim name: {}", agent.name);
         }
         let command = &agent.name;
+        // Version-less: resolve through the pinned global config so the shim
+        // never triggers a runtime install (which the unprivileged session
+        // user could not write into /opt/mise anyway).
         let package = mise_install_package(&agent.package)?;
+        let package = package
+            .split_once('@')
+            .map_or(package.as_str(), |(name, _)| name)
+            .to_string();
         let path = format!("/usr/local/bin/{}", agent.name);
         script.push_str(&format!(
             "cat > {} <<'WRAP_SHIM'\n#!/bin/sh\nexec mise exec {} -- {} \"$@\"\nWRAP_SHIM\nchmod 0755 {}\n",
@@ -650,7 +721,9 @@ async fn install_agent_shims(sandbox: &Sandbox, cfg: &config::Config) -> Result<
             shell_quote(&path),
         ));
     }
-    let output = sandbox.shell(script).await.context("install agent shims")?;
+    let output = root_shell(sandbox, script)
+        .await
+        .context("install agent shims")?;
     if !output.status().success {
         let stderr = String::from_utf8_lossy(output.stderr_bytes());
         bail!(
@@ -659,6 +732,80 @@ async fn install_agent_shims(sandbox: &Sandbox, cfg: &config::Config) -> Result<
         );
     }
     Ok(())
+}
+
+/// Realign the guest `user` uid/gid with the host owner of the workspace.
+///
+/// The workspace is a virtiofs bind mount with stat virtualization off, so the
+/// guest sees literal host ownership. Matching ids is what makes /workspace
+/// writable for the unprivileged session without chowning host files (which
+/// would otherwise leave `user.msb.override_stat` xattrs on every file).
+async fn align_guest_identity(sandbox: &Sandbox, identity: HostIdentity) -> Result<()> {
+    let script = format!(
+        "set -eu\n\
+         uid={uid}; gid={gid}\n\
+         cur_gid=$(getent group {user} | cut -d: -f3)\n\
+         if [ \"$cur_gid\" != \"$gid\" ]; then\n\
+           if getent group \"$gid\" >/dev/null; then groupmod -o -g \"$gid\" {user}; else groupmod -g \"$gid\" {user}; fi\n\
+         fi\n\
+         cur_uid=$(id -u {user})\n\
+         if [ \"$cur_uid\" != \"$uid\" ]; then usermod -o -u \"$uid\" -g \"$gid\" {user}; fi\n\
+         # Everything `user` owns follows the id change: home and the toolchain.\n\
+         if [ \"$cur_uid\" != \"$uid\" ] || [ \"$cur_gid\" != \"$gid\" ]; then\n\
+           chown -R \"$uid:$gid\" {home} {mise}\n\
+         fi\n",
+        uid = identity.uid,
+        gid = identity.gid,
+        user = GUEST_USER,
+        home = shell_quote(GUEST_HOME),
+        mise = shell_quote("/opt/mise"),
+    );
+    let output = root_shell(sandbox, script)
+        .await
+        .context("align guest user identity")?;
+    if !output.status().success {
+        let stderr = String::from_utf8_lossy(output.stderr_bytes());
+        bail!(
+            "align guest user identity exited {}: {}",
+            output.status().code,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostIdentity {
+    uid: u32,
+    gid: u32,
+}
+
+/// Owner of the workspace directory on the host.
+fn host_identity(cwd: &Path) -> Result<HostIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(cwd).with_context(|| format!("stat workspace {}", cwd.display()))?;
+    Ok(HostIdentity {
+        uid: meta.uid(),
+        gid: meta.gid(),
+    })
+}
+
+/// Guest account the session runs as. A root-owned workspace (wrap itself run
+/// as root) keeps root in the guest; anything else drops to `user`.
+fn guest_user(identity: HostIdentity) -> &'static str {
+    if identity.uid == 0 {
+        GUEST_ROOT
+    } else {
+        GUEST_USER
+    }
+}
+
+fn guest_home(identity: HostIdentity) -> &'static str {
+    if identity.uid == 0 {
+        "/root"
+    } else {
+        GUEST_HOME
+    }
 }
 
 async fn open_or_create_session(
@@ -772,6 +919,8 @@ async fn create_session(
     let guest_host = workspace_base(cwd);
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
     let policy = session_policy(cfg)?;
+    let identity = host_identity(cwd)?;
+    let user = guest_user(identity);
 
     let mut builder = Sandbox::builder(name)
         .from_snapshot(base_snapshot)
@@ -783,13 +932,19 @@ async fn create_session(
         .hostname(&guest_host)
         .replace()
         .label(BASE_LAYOUT_LABEL, base_snapshot)
-        .env("HOME", "/root")
-        .env("USER", "root")
+        .user(user)
+        .env("HOME", guest_home(identity))
+        .env("USER", user)
         .env("TERM", &term)
         .env("OUTER_HOSTNAME", &outer_host)
         .env("OUTER_PWD", &outer_pwd)
         .env("OUTER_PWD_BASE", &outer_pwd_base)
-        .volume(WORKSPACE, |v| v.bind(cwd.to_path_buf()))
+        // Literal host ownership: with the guest user realigned to the host
+        // owner, the mount is writable without any chown or xattr overlay.
+        .volume(WORKSPACE, |v| {
+            v.bind(cwd.to_path_buf())
+                .stat_virtualization(StatVirtualization::Off)
+        })
         .network(|n| n.policy(policy));
     let localtime = Path::new("/etc/localtime");
     if localtime.exists() {
@@ -801,7 +956,11 @@ async fn create_session(
     }
 
     builder = apply_secrets(builder, secrets);
-    builder.create().await.context("create session sandbox")
+    let sandbox = builder.create().await.context("create session sandbox")?;
+    if user == GUEST_USER {
+        align_guest_identity(&sandbox, identity).await?;
+    }
+    Ok(sandbox)
 }
 
 fn apply_secrets(
@@ -901,9 +1060,7 @@ async fn enter_session(
 }
 
 fn guest_exports(cfg: &config::Config) -> String {
-    let mut out =
-        r#"export PATH="/usr/local/bin:/root/.local/bin:/root/.local/share/mise/shims:$PATH""#
-            .to_string();
+    let mut out = format!(r#"export PATH="{GUEST_PATH_PREFIX}:$PATH""#);
     for (key, value) in &cfg.env {
         out.push_str("; export ");
         out.push_str(key);
@@ -1064,10 +1221,17 @@ mod tests {
             )));
         }
         assert!(!stages[0].script.contains("pacman"));
-        assert_eq!(
-            stages[0].script.trim_end(),
-            "set -eu\nexport HOME=/root\nexport USER=root\nexport PATH=\"/root/.local/bin:/root/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\ntrue"
+        assert_eq!(stages[0].script, build_script("true"));
+        // Build layers run as `user` and install into the shared /opt toolchain.
+        assert!(stages[0].script.contains("export HOME=/home/user"));
+        assert!(
+            stages[0]
+                .script
+                .contains("export MISE_DATA_DIR=/opt/mise/data")
         );
+        assert!(stages[0].script.contains("/opt/mise/data/shims"));
+        assert!(!stages[0].script.contains("/root"));
+        assert!(stages[0].script.trim_end().ends_with("\ntrue"));
         assert_eq!(
             stages[1].script.matches("mise use --global --pin").count(),
             1
@@ -1136,6 +1300,42 @@ mod tests {
         cfg.env.insert("SSH_CONNECTION".into(), "true".into());
         let exports = guest_exports(&cfg);
         assert!(exports.contains("SSH_CONNECTION=true"));
+    }
+
+    #[test]
+    fn guest_exports_use_shared_toolchain() {
+        let cfg: config::Config =
+            serde_yaml::from_str(include_str!("../resources/default.yml")).unwrap();
+        let exports = guest_exports(&cfg);
+        assert!(exports.contains("/opt/mise/data/shims"));
+        assert!(exports.contains("$HOME/.local/bin"));
+        assert!(!exports.contains("/root"));
+    }
+
+    #[test]
+    fn drops_to_user_unless_workspace_is_root_owned() {
+        let user = HostIdentity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let root = HostIdentity { uid: 0, gid: 0 };
+        assert_eq!(guest_user(user), GUEST_USER);
+        assert_eq!(guest_home(user), GUEST_HOME);
+        assert_eq!(guest_user(root), GUEST_ROOT);
+        assert_eq!(guest_home(root), "/root");
+    }
+
+    #[test]
+    fn chowns_imported_state_and_home_parents() {
+        let script = chown_to_guest_user("/home/user/.config/pi/agent");
+        assert!(script.starts_with("chown -R user:user /home/user/.config/pi/agent\n"));
+        assert!(script.contains("chown user:user /home/user/.config/pi\n"));
+        assert!(script.contains("chown user:user /home/user/.config\n"));
+        assert!(!script.contains("chown user:user /home/user\n"));
+        assert!(!script.contains("chown user:user /\n"));
+
+        let outside = chown_to_guest_user("/opt/state");
+        assert_eq!(outside, "chown -R user:user /opt/state\n");
     }
 
     #[test]
