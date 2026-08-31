@@ -72,6 +72,48 @@ pub struct NetworkConfig {
     pub allow_host: Vec<String>,
     #[serde(default)]
     pub deny_host: Vec<String>,
+    /// TCP ports published from the guest to the host's loopback, as
+    /// `"HOST:GUEST"` or `"PORT"` (same on both sides).
+    #[serde(default)]
+    pub ports: Vec<PortSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortSpec {
+    pub host: u16,
+    pub guest: u16,
+}
+
+impl<'de> Deserialize<'de> for PortSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Port(u16),
+            Text(String),
+        }
+        let (host, guest) = match Raw::deserialize(deserializer)? {
+            Raw::Port(port) => (port, port),
+            Raw::Text(text) => {
+                let parse = |s: &str| {
+                    s.trim().parse::<u16>().map_err(|_| {
+                        serde::de::Error::custom(format!("invalid port {s:?} in {text:?}"))
+                    })
+                };
+                match text.split_once(':') {
+                    Some((host, guest)) => (parse(host)?, parse(guest)?),
+                    None => {
+                        let port = parse(&text)?;
+                        (port, port)
+                    }
+                }
+            }
+        };
+        if host == 0 || guest == 0 {
+            return Err(serde::de::Error::custom("port must be 1-65535"));
+        }
+        Ok(PortSpec { host, guest })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -452,6 +494,31 @@ mod tests {
     fn rejects_legacy_and_unknown_keys() {
         let err = serde_yaml::from_str::<Config>("base_image: archlinux\n").unwrap_err();
         assert!(err.to_string().contains("unknown field `base_image`"));
+    }
+
+    #[test]
+    fn parses_port_specs() {
+        let cfg: Config =
+            serde_yaml::from_str("network:\n  ports: [6080, '5901:5900', ' 9222 ']\n").unwrap();
+        assert_eq!(
+            cfg.network.ports,
+            [
+                PortSpec {
+                    host: 6080,
+                    guest: 6080
+                },
+                PortSpec {
+                    host: 5901,
+                    guest: 5900
+                },
+                PortSpec {
+                    host: 9222,
+                    guest: 9222
+                },
+            ]
+        );
+        assert!(serde_yaml::from_str::<Config>("network:\n  ports: ['0']\n").is_err());
+        assert!(serde_yaml::from_str::<Config>("network:\n  ports: ['a:b']\n").is_err());
     }
 
     #[test]

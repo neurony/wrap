@@ -145,7 +145,7 @@ async fn run() -> Result<u8> {
     let resources = vm_resources(&cli, &cfg)?;
 
     let base_snapshot = ensure_base_snapshot(&ui, &cfg, cli.rebuild, &secrets).await?;
-    let base_layout = base_layout_identity(&base_snapshot).await?;
+    let base_layout = base_layout_identity(&base_snapshot, &cfg).await?;
 
     let name = sandbox_name(&cwd)?;
     let (sandbox, kind) = open_or_create_session(
@@ -355,11 +355,25 @@ async fn ensure_base_snapshot(
 /// it survives a `--rebuild` that pulled a newer `:latest`. The snapshot
 /// content digest does not, which is what makes every workspace's session
 /// notice a refreshed base and recreate itself.
-async fn base_layout_identity(base_snapshot: &str) -> Result<String> {
+///
+/// Published ports are part of the sandbox spec and cannot change on a live
+/// VM, so they are folded in too: editing `network.ports` recreates the session.
+async fn base_layout_identity(base_snapshot: &str, cfg: &config::Config) -> Result<String> {
     let snapshot = Snapshot::open(base_snapshot)
         .await
         .with_context(|| format!("open base snapshot {base_snapshot}"))?;
-    Ok(format!("{base_snapshot}@{}", snapshot.digest()))
+    let mut identity = format!("{base_snapshot}@{}", snapshot.digest());
+    if !cfg.network.ports.is_empty() {
+        let ports: Vec<String> = cfg
+            .network
+            .ports
+            .iter()
+            .map(|p| format!("{}:{}", p.host, p.guest))
+            .collect();
+        identity.push_str(";ports=");
+        identity.push_str(&ports.join(","));
+    }
+    Ok(identity)
 }
 
 async fn build_layer(
@@ -1035,6 +1049,10 @@ async fn create_session(
     for (key, value) in &cfg.env {
         builder = builder.env(key, value);
     }
+    // Published to the host loopback only (e.g. the desktop image's noVNC).
+    for port in &cfg.network.ports {
+        builder = builder.port(port.host, port.guest);
+    }
 
     builder = apply_secrets(builder, secrets);
     let sandbox = builder.create().await.context("create session sandbox")?;
@@ -1075,6 +1093,14 @@ fn session_policy(cfg: &config::Config) -> Result<NetworkPolicy, microsandbox::M
     } else {
         NetworkPolicy::builder().default_deny()
     };
+    // default_deny() also denies *ingress*, which silently breaks published
+    // ports. Open inbound only on the guest ports we publish. (The port proxy's
+    // peer is not the `Host` group, so this must be destination-any.)
+    let published: Vec<u16> = cfg.network.ports.iter().map(|p| p.guest).collect();
+    let mut builder = builder;
+    if !published.is_empty() {
+        builder = builder.ingress(|i| i.tcp().ports(published.iter().copied()).allow().any());
+    }
     builder
         .egress(|e| {
             e.tcp()

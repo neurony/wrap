@@ -7,8 +7,10 @@
 #   docker run -it ghcr.io/tobi/wrap:desktop             # shell, desktop autostarts
 #   -e WRAP_DESKTOP_AUTOSTART=0                          # opt out of autostart
 #
-# All listeners bind 127.0.0.1 only: VNC :5900, noVNC :6080, CDP :9222.
-# Reach them through the VM/container's own port forwarding.
+# VNC :5900 and noVNC :6080 listen on all guest interfaces so the VM/container
+# port publish (which targets the guest NIC, not its loopback) can reach them;
+# the host side of that publish is loopback-only. CDP :9222 stays on
+# 127.0.0.1 — only agent-browser inside the guest needs it.
 ARG BASE_IMAGE=ghcr.io/tobi/wrap:latest
 FROM ${BASE_IMAGE}
 
@@ -449,9 +451,9 @@ start() {
     say "desktop up on $DISPLAY ($WRAP_DESKTOP_GEOMETRY)"
   fi
   spawn x11vnc x11vnc -display "$DISPLAY" -forever -shared -nopw -noxdamage -xkb \
-    -rfbport "$WRAP_DESKTOP_VNC_PORT" -localhost -quiet
+    -rfbport "$WRAP_DESKTOP_VNC_PORT" -quiet
   spawn novnc websockify --web /usr/share/novnc \
-    "127.0.0.1:$WRAP_DESKTOP_NOVNC_PORT" "127.0.0.1:$WRAP_DESKTOP_VNC_PORT"
+    "0.0.0.0:$WRAP_DESKTOP_NOVNC_PORT" "127.0.0.1:$WRAP_DESKTOP_VNC_PORT"
   # The one shared Chrome. Explicit --user-data-dir is mandatory: Chrome >= 136
   # refuses --remote-debugging-port on the default profile directory.
   if ! cdp_up; then
@@ -466,7 +468,7 @@ start() {
       sleep 0.1
     done
   fi
-  say "vnc  127.0.0.1:$WRAP_DESKTOP_VNC_PORT   novnc http://127.0.0.1:$WRAP_DESKTOP_NOVNC_PORT/vnc.html"
+  say "vnc  :$WRAP_DESKTOP_VNC_PORT   novnc http://127.0.0.1:$WRAP_DESKTOP_NOVNC_PORT/vnc.html (via port publish)"
   say "cdp  http://127.0.0.1:$WRAP_DESKTOP_CDP_PORT  (agent-browser attaches here)"
 }
 
@@ -525,8 +527,8 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   same browser a human sees over VNC and can take over (log in, solve a captcha,
   hand back). A project-level ./agent-browser.json still overrides, e.g. drop
   `cdp` to get an isolated headed Chrome instead. `agent-browser doctor` verifies.
-- View: VNC 127.0.0.1:5900 (no password) or noVNC http://127.0.0.1:6080/vnc.html —
-  everything binds localhost; forward ports from the host.
+- View: VNC :5900 (no password) or noVNC http://<host>:6080/vnc.html through the
+  VM's published ports (wrap: `network.ports: [6080]`; the host side is loopback).
 EOF
 
 # Anything a root build step may have left in the user's home belongs to user.

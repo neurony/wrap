@@ -38,7 +38,7 @@ async fn fresh_workspaces_reuse_shared_snapshot_and_clean_up() {
             .await
             .expect("sandbox remains observable after wrap returns");
         status_at_return.push(handle.status_snapshot());
-        // Label form: `<snapshot name>@<snapshot content digest>`.
+        // Label form: `<snapshot name>@<snapshot content digest>[;ports=...]`.
         let label = handle
             .config()
             .expect("read sandbox config")
@@ -49,7 +49,10 @@ async fn fresh_workspaces_reuse_shared_snapshot_and_clean_up() {
             .clone();
         let (snapshot_name, labeled_digest) = label
             .split_once('@')
-            .map(|(name, digest)| (name.to_owned(), digest.to_owned()))
+            .map(|(name, rest)| {
+                let digest = rest.split(';').next().unwrap_or(rest);
+                (name.to_owned(), digest.to_owned())
+            })
             .expect("base layout label carries the snapshot digest");
         let digest = Snapshot::open(&snapshot_name)
             .await

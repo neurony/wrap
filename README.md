@@ -128,11 +128,26 @@ Agent configuration copied from the host (`~/.pi`, `~/.omp`, ...) lands under `/
 - X display `:1` (Xvfb, 1280x800) running a minimal XFCE — navy backdrop, one bottom dock with Chrome, Thunar and Terminal — autostarted from login shells; `wrap-desktop start|stop|status|url`.
 - One persistent Google Chrome on that desktop (no window until agent-browser or the dock opens one) with CDP on `127.0.0.1:9222`. The setup speedrun is baked in system-wide: managed policies (`/etc/opt/chrome/policies/managed`) and `initial_preferences` disable sign-in, sync, default-browser, privacy-sandbox, promo, password/autofill and keyring prompts, so neither agents nor humans ever see first-run UI.
 - `agent-browser` preinstalled and preconfigured (`~/.agent-browser/config.json`, `cdp: 9222`) to attach to that Chrome: `agent-browser open https://example.com` acts in the same browser you see over VNC, so you can watch, log in, or take over and hand back. A project `./agent-browser.json` still overrides (drop `cdp` for an isolated headed Chrome).
-- View it over VNC `127.0.0.1:5900` (no password) or noVNC `http://127.0.0.1:6080/vnc.html`. All listeners bind localhost inside the guest; reach them through the VM's port forwarding.
+- View it over noVNC at `http://127.0.0.1:6080/vnc.html` (or VNC on 5900, no password) by publishing the ports in `~/.config/wrap/config.yml`; the host side is loopback-only.
+
+Use it from wrap:
+
+```yaml
+# ~/.config/wrap/config.yml
+image: ghcr.io/tobi/wrap:desktop
+network:
+  ports: [6080]        # host 127.0.0.1:6080 -> guest noVNC; "HOST:GUEST" also works
+```
 
 ```bash
-docker run -d --network host ghcr.io/tobi/wrap:desktop         # desktop + chrome, localhost ports
-docker run -it ghcr.io/tobi/wrap:desktop                       # shell as `user`; desktop autostarts
+wrap -- agent-browser open https://example.com     # then open http://127.0.0.1:6080/vnc.html
+```
+
+Or standalone:
+
+```bash
+docker run -d -p 127.0.0.1:6080:6080 ghcr.io/tobi/wrap:desktop   # desktop + chrome
+docker run -it ghcr.io/tobi/wrap:desktop                         # shell as `user`; desktop autostarts
 ```
 
 ## Network and credentials
