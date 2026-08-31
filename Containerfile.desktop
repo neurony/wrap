@@ -70,7 +70,14 @@ RUN curl -fsSL -o /tmp/chrome.deb \
  && ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome-stable \
  && ln -sf /opt/google/chrome/google-chrome /usr/bin/google-chrome \
  && chmod 4755 /opt/google/chrome/chrome-sandbox \
+ && for s in 16 24 32 48 64 128 256; do \
+      install -D -m 0644 "/opt/google/chrome/product_logo_$s.png" \
+        "/usr/share/icons/hicolor/${s}x${s}/apps/google-chrome.png"; \
+    done \
+ && gtk-update-icon-cache -f -t /usr/share/icons/hicolor \
  && /opt/google/chrome/google-chrome --version
+# (The .deb's postinst, which we skip, is what normally installs those icons;
+#  the hicolor cache must be rebuilt or GTK trusts the stale one and shows "?".)
 
 # ---------------------------------------------------------------------------
 # Speedrun Chrome's setup. Two layers, both system-wide:
@@ -183,6 +190,30 @@ RUN chmod 0755 /usr/local/bin/google-chrome-stable \
  && ln -sf google-chrome-stable /usr/local/bin/google-chrome \
  && ln -sf google-chrome-stable /usr/local/bin/chrome
 
+# wrap-chrome: open in the *shared* desktop Chrome (the CDP instance) rather
+# than a second profile. Chrome hands the URL to the running instance when the
+# profile dir matches. Used by wrap-desktop and by the dock launcher.
+RUN cat > /usr/local/bin/wrap-chrome <<'EOF'
+#!/bin/sh
+: "${WRAP_DESKTOP_CHROME_PROFILE:=$HOME/.config/wrap-chrome}"
+: "${WRAP_DESKTOP_CDP_PORT:=9222}"
+exec google-chrome-stable --user-data-dir="$WRAP_DESKTOP_CHROME_PROFILE" \
+  --remote-debugging-port="$WRAP_DESKTOP_CDP_PORT" --remote-debugging-address=127.0.0.1 "$@"
+EOF
+RUN chmod 0755 /usr/local/bin/wrap-chrome \
+ && cat > /usr/share/applications/wrap-chrome.desktop <<'EOF'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Chrome
+Comment=Shared desktop browser (CDP on localhost:9222)
+Exec=wrap-chrome %U
+Icon=google-chrome
+Terminal=false
+Categories=Network;WebBrowser;
+StartupWMClass=Google-chrome
+EOF
+
 # ---------------------------------------------------------------------------
 # agent-browser, pinned into the shared /opt/mise toolchain like the other
 # tools (node comes from the base image). Installed *as user*: /opt/mise is
@@ -219,12 +250,59 @@ RUN for home in /root /home/user; do \
     done \
  && chown -R "${WRAP_UID}:${WRAP_GID}" /home/user/.agent-browser
 
-# XFCE: skip the "first start of the panel" dialog by seeding the default
-# panel layout; no screensaver/power-manager installed; never lock.
+# XFCE look: no top bar, one centered bottom dock with three launchers
+# (Chrome / Thunar / Terminal) on a transparent panel, solid navy backdrop,
+# no desktop icons or right-click menu, nothing that can lock or prompt.
+# Seeded into /etc/skel and both existing homes so the first start is final.
 RUN install -d /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml \
- && cp /etc/xdg/xfce4/panel/default.xml \
-      /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml \
- && cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml <<'EOF'
+      /etc/skel/.config/xfce4/panel/launcher-1 \
+      /etc/skel/.config/xfce4/panel/launcher-2 \
+      /etc/skel/.config/xfce4/panel/launcher-3 \
+ && cp /usr/share/applications/wrap-chrome.desktop     /etc/skel/.config/xfce4/panel/launcher-1/ \
+ && cp /usr/share/applications/thunar.desktop          /etc/skel/.config/xfce4/panel/launcher-2/ \
+ && cp /usr/share/applications/xfce4-terminal.desktop  /etc/skel/.config/xfce4/panel/launcher-3/ \
+ && cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-panel" version="1.0">
+  <property name="configver" type="int" value="2"/>
+  <property name="panels" type="array">
+    <value type="int" value="1"/>
+    <property name="dark-mode" type="bool" value="true"/>
+    <property name="panel-1" type="empty">
+      <property name="position" type="string" value="p=10;x=0;y=0"/>
+      <property name="position-locked" type="bool" value="true"/>
+      <property name="length" type="uint" value="1"/>
+      <property name="size" type="uint" value="64"/>
+      <property name="icon-size" type="uint" value="48"/>
+      <property name="autohide-behavior" type="uint" value="0"/>
+      <property name="background-style" type="uint" value="1"/>
+      <property name="background-rgba" type="array">
+        <value type="double" value="0"/>
+        <value type="double" value="0"/>
+        <value type="double" value="0"/>
+        <value type="double" value="0"/>
+      </property>
+      <property name="plugin-ids" type="array">
+        <value type="int" value="1"/>
+        <value type="int" value="2"/>
+        <value type="int" value="3"/>
+      </property>
+    </property>
+  </property>
+  <property name="plugins" type="empty">
+    <property name="plugin-1" type="string" value="launcher">
+      <property name="items" type="array"><value type="string" value="wrap-chrome.desktop"/></property>
+    </property>
+    <property name="plugin-2" type="string" value="launcher">
+      <property name="items" type="array"><value type="string" value="thunar.desktop"/></property>
+    </property>
+    <property name="plugin-3" type="string" value="launcher">
+      <property name="items" type="array"><value type="string" value="xfce4-terminal.desktop"/></property>
+    </property>
+  </property>
+</channel>
+EOF
+RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfce4-session" version="1.0">
   <property name="general" type="empty">
@@ -237,11 +315,31 @@ RUN install -d /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml \
   </property>
 </channel>
 EOF
+# Xvfb's RANDR output is named "screen", hence monitorscreen.
 RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfce4-desktop" version="1.0">
+  <property name="backdrop" type="empty">
+    <property name="screen0" type="empty">
+      <property name="monitorscreen" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="image-style" type="int" value="0"/>
+          <property name="color-style" type="int" value="0"/>
+          <property name="rgba1" type="array">
+            <value type="double" value="0.11"/>
+            <value type="double" value="0.14"/>
+            <value type="double" value="0.21"/>
+            <value type="double" value="1"/>
+          </property>
+        </property>
+      </property>
+    </property>
+  </property>
   <property name="desktop-icons" type="empty">
     <property name="style" type="int" value="0"/>
+  </property>
+  <property name="desktop-menu" type="empty">
+    <property name="show" type="bool" value="false"/>
   </property>
 </channel>
 EOF
@@ -359,11 +457,9 @@ start() {
   if ! cdp_up; then
     rm -f "$run_dir/chrome.pid"
     install -d "$WRAP_DESKTOP_CHROME_PROFILE"
-    spawn chrome google-chrome-stable \
-      --user-data-dir="$WRAP_DESKTOP_CHROME_PROFILE" \
-      --remote-debugging-port="$WRAP_DESKTOP_CDP_PORT" \
-      --remote-debugging-address=127.0.0.1 \
-      --start-maximized
+    # --no-startup-window: the browser process (and CDP) is up, but the
+    # desktop stays clean until agent-browser or the dock opens a window.
+    spawn chrome wrap-chrome --no-startup-window
     i=0
     until cdp_up; do
       i=$((i + 1)); [ "$i" -lt 150 ] || { say "chrome CDP did not come up (see $log)"; exit 1; }
@@ -419,8 +515,9 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   `wrap-desktop start|stop|status|url|screenshot [FILE]` (screenshot = whole desktop).
 - Local CA anchors (e.g. a TLS-intercepting sandbox's CA) are imported into
   Chrome's NSS store at start, so intercepted hosts load without cert errors.
-- One persistent Google Chrome window on that desktop, CDP on 127.0.0.1:9222,
-  profile in ~/.config/wrap-chrome. First-run, sign-in, sync, default-browser,
+- One persistent Google Chrome on that desktop (no window until something opens
+  one; the dock's Chrome icon opens a window in the same instance), CDP on
+  127.0.0.1:9222, profile in ~/.config/wrap-chrome. First-run, sign-in, sync, default-browser,
   privacy-sandbox, keyring and promo prompts are disabled via managed policies in
   /etc/opt/chrome/policies/managed and /opt/google/chrome/initial_preferences.
 - agent-browser is preconfigured (~/.agent-browser/config.json, `cdp: 9222`) to
