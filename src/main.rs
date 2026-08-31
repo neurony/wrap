@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use microsandbox::{
     ExecEvent, NetworkPolicy, NetworkProfile, Sandbox, Snapshot,
-    sandbox::{SandboxHandle, SandboxStatus, StatVirtualization},
+    sandbox::{PullPolicy, SandboxHandle, SandboxStatus, StatVirtualization},
     size::SizeExt,
 };
 use sha2::{Digest, Sha256};
@@ -40,8 +40,26 @@ const GUEST_ROOT: &str = "root";
 /// Toolchain lives at absolute paths outside any $HOME (see Containerfile).
 const MISE_DATA_DIR: &str = "/opt/mise/data";
 const MISE_CONFIG_DIR: &str = "/opt/mise/config";
-pub(crate) const GUEST_PATH_PREFIX: &str =
-    "/usr/local/bin:$HOME/.local/bin:/opt/mise/data/shims:/opt/wrap/bin";
+/// Directories every guest command should see first on PATH, in order.
+const GUEST_PATH_DIRS: [&str; 4] = [
+    "/usr/local/bin",
+    "$HOME/.local/bin",
+    "/opt/mise/data/shims",
+    "/opt/wrap/bin",
+];
+
+/// POSIX-sh snippet that prepends [`GUEST_PATH_DIRS`] to PATH, skipping any
+/// that are already present. The image env and the guest's profile scripts
+/// export the same dirs, so an unconditional prepend stacks duplicates.
+pub(crate) fn guest_path_exports() -> String {
+    GUEST_PATH_DIRS
+        .iter()
+        .rev()
+        .map(|dir| format!(r#"case ":$PATH:" in *":{dir}:"*) ;; *) PATH="{dir}:$PATH" ;; esac"#))
+        .chain(std::iter::once("export PATH".to_string()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 static HOST_COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser, Debug)]
@@ -128,6 +146,7 @@ async fn run() -> Result<u8> {
     let resources = vm_resources(&cli, &cfg)?;
 
     let base_snapshot = ensure_base_snapshot(&ui, &cfg, cli.rebuild, &secrets).await?;
+    let base_layout = base_layout_identity(&base_snapshot).await?;
 
     let name = sandbox_name(&cwd)?;
     let (sandbox, kind) = open_or_create_session(
@@ -136,6 +155,7 @@ async fn run() -> Result<u8> {
         &cfg,
         resources,
         &base_snapshot,
+        &base_layout,
         &name,
         &cwd,
         &secrets,
@@ -327,6 +347,19 @@ async fn ensure_base_snapshot(
     Ok(base_snapshot)
 }
 
+/// Value recorded on each session as `BASE_LAYOUT_LABEL`.
+///
+/// The snapshot *name* only encodes the image reference and layer scripts, so
+/// it survives a `--rebuild` that pulled a newer `:latest`. The snapshot
+/// content digest does not, which is what makes every workspace's session
+/// notice a refreshed base and recreate itself.
+async fn base_layout_identity(base_snapshot: &str) -> Result<String> {
+    let snapshot = Snapshot::open(base_snapshot)
+        .await
+        .with_context(|| format!("open base snapshot {base_snapshot}"))?;
+    Ok(format!("{base_snapshot}@{}", snapshot.digest()))
+}
+
 async fn build_layer(
     ui: &Ui,
     cfg: &config::Config,
@@ -350,7 +383,12 @@ async fn build_layer(
     builder = if let Some(snapshot) = parent {
         builder.from_snapshot(snapshot)
     } else {
-        builder.image_with(|i| i.oci(IMAGE).root_disk(ROOT_DISK_GIB.gib()))
+        // The image stage only runs on first build or --rebuild; both want the
+        // registry's current `latest`, not a stale local tag. Always re-checks
+        // the manifest and only fetches layers whose digests changed.
+        builder
+            .image_with(|i| i.oci(IMAGE).root_disk(ROOT_DISK_GIB.gib()))
+            .pull_policy(PullPolicy::Always)
     };
     builder = apply_secrets(builder, secrets);
 
@@ -814,6 +852,7 @@ async fn open_or_create_session(
     cfg: &config::Config,
     resources: VmResources,
     base_snapshot: &str,
+    base_layout: &str,
     name: &str,
     cwd: &Path,
     secrets: &config::ResolvedSecrets,
@@ -832,7 +871,7 @@ async fn open_or_create_session(
             .labels
             .get(BASE_LAYOUT_LABEL)
             .cloned();
-        if current_base.as_deref() != Some(base_snapshot) {
+        if current_base.as_deref() != Some(base_layout) {
             ui.setting_up_project();
             live.phase("updating base layout")?;
             CrossingKind::Reset
@@ -856,7 +895,17 @@ async fn open_or_create_session(
     };
 
     live.phase("cloning shared snapshot")?;
-    let sandbox = match create_session(cfg, resources, base_snapshot, name, cwd, secrets).await {
+    let sandbox = match create_session(
+        cfg,
+        resources,
+        base_snapshot,
+        base_layout,
+        name,
+        cwd,
+        secrets,
+    )
+    .await
+    {
         Ok(sandbox) => sandbox,
         Err(err) => {
             live.fail("create failed");
@@ -909,6 +958,7 @@ async fn create_session(
     cfg: &config::Config,
     resources: VmResources,
     base_snapshot: &str,
+    base_layout: &str,
     name: &str,
     cwd: &Path,
     secrets: &config::ResolvedSecrets,
@@ -931,7 +981,7 @@ async fn create_session(
         .workdir(WORKSPACE)
         .hostname(&guest_host)
         .replace()
-        .label(BASE_LAYOUT_LABEL, base_snapshot)
+        .label(BASE_LAYOUT_LABEL, base_layout)
         .user(user)
         .env("HOME", guest_home(identity))
         .env("USER", user)
@@ -1060,7 +1110,7 @@ async fn enter_session(
 }
 
 fn guest_exports(cfg: &config::Config) -> String {
-    let mut out = format!(r#"export PATH="{GUEST_PATH_PREFIX}:$PATH""#);
+    let mut out = guest_path_exports();
     for (key, value) in &cfg.env {
         out.push_str("; export ");
         out.push_str(key);
@@ -1310,6 +1360,27 @@ mod tests {
         assert!(exports.contains("/opt/mise/data/shims"));
         assert!(exports.contains("$HOME/.local/bin"));
         assert!(!exports.contains("/root"));
+    }
+
+    #[test]
+    fn guest_path_exports_are_idempotent() {
+        let script = guest_path_exports();
+        let run = |path: &str| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{script}; printf '%s' \"$PATH\""))
+                .env("HOME", "/home/user")
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let once = run("/usr/bin:/bin");
+        assert_eq!(
+            once,
+            "/usr/local/bin:/home/user/.local/bin:/opt/mise/data/shims:/opt/wrap/bin:/usr/bin:/bin"
+        );
+        assert_eq!(run(&once), once, "second application must not stack");
     }
 
     #[test]

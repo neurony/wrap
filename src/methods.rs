@@ -245,11 +245,7 @@ fn find_script(args: &[String]) -> String {
 }
 
 fn bash_script(script: &str) -> String {
-    format!(
-        r#"export PATH="{}:$PATH"; {}"#,
-        crate::GUEST_PATH_PREFIX,
-        script
-    )
+    format!("{}; {}", crate::guest_path_exports(), script)
 }
 
 fn shell_join_local(args: &[String]) -> String {
