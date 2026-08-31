@@ -19,7 +19,7 @@ ENV HOME=/root USER=root
 # One shared X display for everything. agent-browser sees DISPLAY set and puts
 # Chrome on the XFCE desktop instead of spawning a private Xvfb.
 ENV DISPLAY=:1 \
-    WRAP_DESKTOP_GEOMETRY=1920x1080x24 \
+    WRAP_DESKTOP_GEOMETRY=1280x800x24 \
     WRAP_DESKTOP_VNC_PORT=5900 \
     WRAP_DESKTOP_NOVNC_PORT=6080 \
     WRAP_DESKTOP_CDP_PORT=9222 \
@@ -269,7 +269,7 @@ RUN cat > /opt/wrap/bin/wrap-desktop <<'EOF'
 set -eu
 
 : "${DISPLAY:=:1}"
-: "${WRAP_DESKTOP_GEOMETRY:=1920x1080x24}"
+: "${WRAP_DESKTOP_GEOMETRY:=1280x800x24}"
 : "${WRAP_DESKTOP_VNC_PORT:=5900}"
 : "${WRAP_DESKTOP_NOVNC_PORT:=6080}"
 : "${WRAP_DESKTOP_CDP_PORT:=9222}"
@@ -327,7 +327,7 @@ start() {
       --user-data-dir="$WRAP_DESKTOP_CHROME_PROFILE" \
       --remote-debugging-port="$WRAP_DESKTOP_CDP_PORT" \
       --remote-debugging-address=127.0.0.1 \
-      --window-size=1600,1000 --window-position=0,0
+      --start-maximized
     i=0
     until cdp_up; do
       i=$((i + 1)); [ "$i" -lt 150 ] || { say "chrome CDP did not come up (see $log)"; exit 1; }
@@ -374,7 +374,7 @@ EOF
 RUN cat > /etc/wrap/desktop.md <<'EOF'
 # wrap desktop
 
-- X display `:1` (Xvfb, 1920x1080) running XFCE. Autostarts from login shells;
+- X display `:1` (Xvfb, 1280x800) running XFCE. Autostarts from login shells;
   `wrap-desktop start|stop|status|url`.
 - One persistent Google Chrome window on that desktop, CDP on 127.0.0.1:9222,
   profile in ~/.config/wrap-chrome. First-run, sign-in, sync, default-browser,
