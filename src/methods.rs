@@ -303,31 +303,34 @@ mod tests {
         assert_eq!(
             parse_selector("src/main.rs:5:2"),
             Selector {
-                path: "/workspace/src/main.rs".into(),
+                path: "/home/user/workspace/src/main.rs".into(),
                 lines: LineSpec::Count { start: 5, count: 2 },
             }
         );
         assert_eq!(
-            parse_selector("/workspace/foo.rs:10-12"),
+            parse_selector("/home/user/workspace/foo.rs:10-12"),
             Selector {
-                path: "/workspace/foo.rs".into(),
+                path: "/home/user/workspace/foo.rs".into(),
                 lines: LineSpec::Range { start: 10, end: 12 },
             }
         );
         assert_eq!(
             parse_selector("README.md:3"),
             Selector {
-                path: "/workspace/README.md".into(),
+                path: "/home/user/workspace/README.md".into(),
                 lines: LineSpec::From(3),
             }
         );
-        assert_eq!(parse_selector(".").path, "/workspace");
+        assert_eq!(parse_selector(".").path, "/home/user/workspace");
     }
 
     #[test]
     fn read_script_uses_sed_count() {
         let sel = parse_selector("file:5:2");
-        assert_eq!(read_script(&sel), "sed -n '5,6p' -- /workspace/file");
+        assert_eq!(
+            read_script(&sel),
+            "sed -n '5,6p' -- /home/user/workspace/file"
+        );
     }
 
     #[test]

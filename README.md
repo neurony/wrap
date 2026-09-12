@@ -3,7 +3,7 @@
 Run commands and coding agents in a disposable Arch Linux microVM built around the folder you are in.
 
 ```text
-host project  ── /workspace ──>  microVM
+host project  ── ~/workspace ──>  microVM
                               ├─ pi / omp / codex / claude
                               ├─ shell tools
                               └─ default-deny network
@@ -40,7 +40,7 @@ cd ~/src/my-project
 wrap
 ```
 
-The current directory is mounted in the VM as `/workspace`. The VM starts from the shared published base container and is cached by workspace, so later starts are quick. The base snapshot is shared; your project VM is separate.
+The current directory is mounted in the VM at `/home/user/workspace`, so shells start in the project. The VM starts from the shared published base container and is cached by workspace, so later starts are quick. The base snapshot is shared; your project VM is separate.
 
 Run one command without opening a shell:
 
@@ -59,7 +59,7 @@ wrap -- bash
 A normal interactive `wrap` starts a login zsh session. The base prompt identifies the guest clearly:
 
 ```text
-[vm:project-name] /workspace ❯
+[vm:project-name] ~/workspace ❯
 ```
 
 ## Run an agent inside the VM
@@ -73,7 +73,7 @@ wrap -- codex
 wrap -- claude
 ```
 
-The corresponding agent configuration is copied from the host into that project VM when it is created. The host configuration stays on the host; it is not baked into the shared base image.
+Host agent configuration (`~/.pi`, `~/.omp`, ...) is not copied in by default. Opt in with `host-copy` on an agent if you want that directory in the project VM; it stays on the host and is never baked into the shared base image.
 
 This is the simplest mode when the agent should work directly in the isolated project environment.
 
@@ -96,7 +96,7 @@ wrap -c "$PWD" write notes.md 'review notes'
 wrap -c "$PWD" bash 'cargo test'
 ```
 
-Relative paths refer to the project mounted at `/workspace`. These methods execute inside the VM and return their output; they do not attach a shell or stop the VM. This is the agent-on-the-outside mode: the orchestrator stays on the host while file inspection, edits, searches, and commands run in the guest.
+Relative paths refer to the project mounted at `/home/user/workspace`. These methods execute inside the VM and return their output; they do not attach a shell or stop the VM. This is the agent-on-the-outside mode: the orchestrator stays on the host while file inspection, edits, searches, and commands run in the guest.
 
 The available methods are:
 
@@ -117,9 +117,9 @@ wrap -c "$PWD" read src/main.rs:40:10
 
 ## Guest user
 
-Everything runs as the unprivileged `user` account inside the VM (`HOME=/home/user`), with passwordless `sudo` for the cases that need it; the container images have no root mode either. Only wrap's own setup plumbing runs as root. The guest `user` is realigned to the uid/gid that owns your project directory on the host, so `/workspace` is writable without any chowning and files created in the VM come back owned by you.
+Everything runs as the unprivileged `user` account inside the VM (`HOME=/home/user`), with passwordless `sudo` for the cases that need it; the container images have no root mode either. Only wrap's own setup plumbing runs as root. The guest `user` is realigned to the uid/gid that owns your project directory on the host, so `~/workspace` is writable without any chowning and files created in the VM come back owned by you.
 
-Agent configuration copied from the host (`~/.pi`, `~/.omp`, ...) lands under `/home/user`.
+If you opt in with `host-copy`, imported host agent configuration lands under `/home/user`.
 
 ## Desktop image
 
@@ -134,7 +134,8 @@ Use it from wrap:
 
 ```yaml
 # ~/.config/wrap/config.yml
-image: ghcr.io/tobi/wrap:desktop
+sandbox:
+  image: ghcr.io/tobi/wrap:desktop
 network:
   ports: [6080]        # host 127.0.0.1:6080 -> guest noVNC; "HOST:GUEST" also works
 ```
@@ -156,23 +157,26 @@ The VM starts with a default-deny network policy. Project traffic is limited to 
 
 You can add or remove allowed hosts in the wrap configuration. A project does not inherit the host's unrestricted network access.
 
-Host secrets are not mounted into `/workspace`, copied into the image, or exposed through an always-on host proxy such as an iron-proxy. When explicitly configured, a credential is granted only to the named hosts and appears to guest processes as a scoped pseudo-token. The VM cannot use that credential for arbitrary destinations.
+Host secrets are not mounted into `~/workspace`, copied into the image, or exposed through an always-on host proxy such as an iron-proxy. When explicitly configured, a credential is granted only to the named hosts and appears to guest processes as a scoped pseudo-token. The VM cannot use that credential for arbitrary destinations.
 
-For example, the default GitHub credential is available only for GitHub hosts. On entry, wrap prints the token names and permitted hosts without printing secret values.
+For example, the default GitHub credential is available only for GitHub hosts. Every build stage and session shell first tries `gh auth token` for a real token and otherwise aliases the live `GH_TOKEN` stand-in to `GITHUB_TOKEN`, so tool installers such as mise authenticate their GitHub API calls instead of hitting anonymous rate limits (header injection substitutes the real value on matching egress). On entry, wrap prints the merge stack (embedded defaults, `config.yml`, `config.d/*.yml`, `WRAPFILE`, `--config`) and a compact exposure report: `network-access: deny` (green) or `allow` (red), reachable hosts with shared credentials grouped on one line and declared headers indented beneath, `deny: everything else`, plus ports, copies, and env when present — without ever printing secret values.
 
 ## Configuration
 
-The built-in defaults live in the release. Local changes go in:
+The built-in defaults live in the release. On first run wrap writes `~/.config/wrap/config.yml` with the entire default set commented out — pure documentation that changes nothing:
 
 ```text
-~/.config/wrap/config.yml
+~/.config/wrap/config.yml        # all defaults commented; uncomment to override
+~/.config/wrap/config.d/*.yml   # personal drop-ins, lexical order
 ```
 
-The local file is an overlay, so it only needs to contain changes. For example:
+Precedence is embedded defaults, then the user config, then `~/.config/wrap/config.d/*.yml` drop-ins in lexical order, then `WRAPFILE` in the workspace, then `--config PATH` / `$WRAP_CONFIG`. `wrap config` prints that fully merged result as YAML without booting a VM.
+
+Keep personal overrides in `config.d/` (`10-shopify.yml`, `20-network.yml`, …) and `config.yml` close to its commented template. For example:
 
 ```yaml
 network:
-  allow_host:
+  allow:
     - .gitlab.com
 
 agents:
@@ -181,17 +185,26 @@ agents:
     host-copy: ~/.omp
 ```
 
-Host values can come from a literal, an environment variable, or a command:
+A workspace-local layer comes from `wrap init`, which writes a starter `WRAPFILE` in the current workspace and exits without booting a VM:
+
+```bash
+cd ~/src/my-project
+wrap init
+```
+
+Secrets name a guest `env` var, a `source`, explicit `headers`, and a `hosts` map. The guest var always holds the constant stand-in `NOT-AN-ACTUAL-KEY`, never the real value:
 
 ```yaml
 secrets:
-  - env: OPENAI_API_KEY
-    host-env: $OPENAI_API_KEY
+  - env: EXTRA_TOKEN
+    source: $EXTRA_TOKEN
+    headers:
+      X-Api-Token: $EXTRA_TOKEN
     hosts:
-      - api.openai.com
+      api.example.com: {allow: true}
 ```
 
-Missing variables, failed commands, and empty command results stop setup before VM work begins.
+A source is `$(command)`, `$HOST_VAR`, `file:/path`, or a literal. Only live (resolved) secret hosts fold into the network allowlist automatically — a skipped optional secret whitelists nothing; `network.deny` still wins. Missing variables, failed commands, and empty command results stop setup before VM work begins, unless the secret is marked `optional: true` — the shipped OpenRouter/OpenAI/Anthropic passthroughs are optional and skip quietly when their host variable is absent.
 
 ## Good uses
 
@@ -210,6 +223,12 @@ wrap --rebuild     # rebuild the shared base layers
 wrap --cpus 8      # override project VM CPUs
 wrap --memory 8192 # set the project VM memory ceiling in MiB
 wrap -c DIR ...    # target an existing VM for a method call
+wrap init          # write WRAPFILE here; exits without booting a VM
+wrap allow HOST    # append HOST to network.allow in WRAPFILE (-g for global)
+wrap log           # denied egress requests from this session's logs (--tail N, --follow)
+wrap config        # print the fully merged config as YAML (no VM)
+wrap --network-allow-everything -- CMD  # open egress for this entry only
+wrap --config FILE # one-off explicit config overlay (or $WRAP_CONFIG)
 ```
 
 `--rebuild` and `--reset` are lifecycle operations. Do not use them with the outside-agent methods.

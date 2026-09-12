@@ -17,16 +17,22 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use microsandbox::{
-    ExecEvent, NetworkPolicy, NetworkProfile, Sandbox, Snapshot,
+    ExecEvent, LogLevel, NetworkPolicy, NetworkProfile, Sandbox, Snapshot,
+    logs::{LogOptions, LogSource},
     sandbox::{PullPolicy, SandboxHandle, SandboxStatus, StatVirtualization},
     size::SizeExt,
 };
 use sha2::{Digest, Sha256};
 use ui::{CrossingKind, Live, Ui};
 
-pub(crate) const WORKSPACE: &str = "/workspace";
+/// Guest path of the bound project. It lives under the guest user's home so
+/// shells, tools, and relative paths treat the project as home; there is no
+/// separate toplevel mount. `$HOME` itself stays `/home/user`, keeping
+/// caches, dotfiles, and host-copies outside the project.
+pub(crate) const WORKSPACE: &str = "/home/user/workspace";
 const BASE_SNAPSHOT_PREFIX: &str = "wrap-image";
 const BASE_LAYOUT_LABEL: &str = "wrap.base-layout";
+const SECRET_VALUES_LABEL: &str = "wrap.secret-values";
 const SESSION_MEMORY_MIN_MIB: u32 = 4096;
 const ROOT_DISK_GIB: u32 = 16;
 /// Unprivileged guest identity baked into the image (passwordless sudo).
@@ -95,9 +101,57 @@ struct Cli {
     #[arg(long)]
     memory: Option<u32>,
 
+    /// Explicit config overlay. Beats the user config and the workspace
+    /// `WRAPFILE`. Also read from `$WRAP_CONFIG` when unset here.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+
+    /// Open all egress for this entry only, without touching any config
+    /// file. The session recreates to pick it up (and recreates back on
+    /// the next entry without the flag); the exposure report shows red.
+    #[arg(long, visible_alias = "yolo")]
+    network_allow_everything: bool,
+
+    #[command(subcommand)]
+    subcommand: Option<Subcommand>,
+
     /// Command to run inside the VM. Default: login zsh.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Subcommand {
+    /// Write a workspace-local `WRAPFILE` and exit without
+    /// booting a VM. (Use `wrap -- init` to run `init` inside the guest.)
+    Init,
+    /// Allow a host through egress and exit without booting a VM. Writes
+    /// the local `WRAPFILE`, or the global config with `--global`.
+    /// Takes effect on next entry (the session recreates automatically).
+    Allow {
+        /// Host to allow: exact, `.suffix`, or `*.wildcard`.
+        host: String,
+        /// Write `~/.config/wrap/config.yml` instead of the workspace file.
+        #[arg(short, long)]
+        global: bool,
+    },
+    /// Print the fully merged config as YAML and exit without booting a
+    /// VM. Includes every overlay (`config.yml`, `config.d`, `WRAPFILE`,
+    /// `--config PATH` / `$WRAP_CONFIG`). Secret sources stay as written;
+    /// resolved values never appear. (Use `wrap -- config` to run `config`
+    /// inside the guest.)
+    Config,
+    /// Show requests the sandbox denied, newest last, without booting a
+    /// VM. Reads this workspace's session logs. (Use `wrap -- log` to
+    /// run `log` inside the guest.)
+    Log {
+        /// Show only the last N denied requests.
+        #[arg(long, default_value = "50")]
+        tail: usize,
+        /// Keep printing new denied requests as they arrive.
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,12 +186,73 @@ async fn run() -> Result<u8> {
         None => std::env::current_dir().context("current directory")?,
     };
 
+    if matches!(cli.subcommand, Some(Subcommand::Init)) {
+        let path = config::init_workspace(&cwd)?;
+        println!("wrote {}", path.display());
+        return Ok(0);
+    }
+
+    if matches!(cli.subcommand, Some(Subcommand::Config)) {
+        let explicit = cli
+            .config
+            .clone()
+            .or_else(|| std::env::var("WRAP_CONFIG").ok().map(PathBuf::from));
+        let loaded = config::load_full(&cwd, explicit.as_deref())?;
+        print!("{}", config::to_yaml(&loaded.config)?);
+        return Ok(0);
+    }
+
+    if let Some(Subcommand::Allow { host, global }) = &cli.subcommand {
+        let path = if *global {
+            let path = config::config_path();
+            // Directory only: a missing global file stays missing until
+            // the allow edit below writes a minimal one.
+            config::ensure_config_dir(&path)?;
+            path
+        } else {
+            let local = cwd.join(config::LOCAL_OVERLAY_FILE);
+            if !local.is_file() {
+                config::init_workspace(&cwd)?;
+            }
+            local
+        };
+        match config::allow_host_in_file(&path, host)? {
+            config::AllowOutcome::Added => {
+                println!("allowed {host} in {}", path.display());
+                println!("takes effect on next entry (the session recreates automatically)");
+            }
+            config::AllowOutcome::AlreadyPresent => {
+                println!("{host} is already allowed in {}", path.display());
+            }
+        }
+        return Ok(0);
+    }
+
+    if let Some(Subcommand::Log { tail, follow }) = &cli.subcommand {
+        let explicit = cli
+            .config
+            .clone()
+            .or_else(|| std::env::var("WRAP_CONFIG").ok().map(PathBuf::from));
+        return run_log(&cwd, explicit.as_deref(), *tail, *follow).await;
+    }
+
     if let Some(method) = fast_method(cli.rebuild, cli.reset, &cli.command) {
         let sandbox = connect_existing(&cwd).await?;
         return methods::run_method(&sandbox, method).await;
     }
 
-    let cfg = config::load()?;
+    let explicit = cli
+        .config
+        .clone()
+        .or_else(|| std::env::var("WRAP_CONFIG").ok().map(PathBuf::from));
+    let loaded = config::load_full(&cwd, explicit.as_deref())?;
+    let mut cfg = loaded.config;
+    // One-entry override: flip the in-memory flag so the session digest,
+    // policy, and exposure report all follow, without writing any file.
+    if cli.network_allow_everything {
+        cfg.network.allow_everything = true;
+    }
+    reject_bare_unknown_command(&cli, &cfg)?;
     let ui = Ui::stderr();
     let host_home = dirs::home_dir().context("home directory")?;
     let secrets = config::resolve_secrets(&cfg)?;
@@ -145,7 +260,7 @@ async fn run() -> Result<u8> {
     let resources = vm_resources(&cli, &cfg)?;
 
     let base_snapshot = ensure_base_snapshot(&ui, &cfg, cli.rebuild, &secrets).await?;
-    let base_layout = base_layout_identity(&base_snapshot, &cfg).await?;
+    let base_layout = base_layout_identity(&base_snapshot, &cfg, &secrets).await?;
 
     let name = sandbox_name(&cwd)?;
     let (sandbox, kind) = open_or_create_session(
@@ -169,13 +284,13 @@ async fn run() -> Result<u8> {
         resources.memory,
         resources.memory_max,
     );
-    let secret_rows: Vec<_> = secrets
-        .found
-        .iter()
-        .map(|secret| (secret.env.as_str(), secret.hosts.as_slice()))
-        .collect();
-    ui.secret_access(&secret_rows);
-    let code = enter_session(&ui, &cfg, &sandbox, &cli.command).await?;
+    ui.exposures(&exposure_report(
+        &cfg,
+        &secrets,
+        &host_copies,
+        &loaded.sources,
+    ));
+    let code = enter_session(&ui, &cfg, &sandbox, &secrets, &cli.command).await?;
     if let Err(err) = sandbox.request_stop().await {
         ui.stop_failed(&err);
     }
@@ -203,6 +318,189 @@ fn fast_method(rebuild: bool, reset: bool, command: &[String]) -> Option<methods
         .flatten()
 }
 
+/// A bare first word (no `--` separator) must name something wrap knows:
+/// a subcommand (handled before this runs), a file method, or a configured
+/// agent whose guest shim runs it. Anything else is a typo that would
+/// otherwise boot a whole VM just to fail with "command not found" inside
+/// the guest, so fail fast with a pointer to the escape hatch instead.
+fn reject_bare_unknown_command(cli: &Cli, cfg: &config::Config) -> Result<()> {
+    if cli.subcommand.is_some() || cli.command.is_empty() || has_explicit_separator() {
+        return Ok(());
+    }
+    if fast_method(cli.rebuild, cli.reset, &cli.command).is_some() {
+        return Ok(());
+    }
+    let first = &cli.command[0];
+    if cfg.agents.iter().any(|agent| agent.name == *first) {
+        return Ok(());
+    }
+    bail!(
+        "unknown command {first:?}: no wrap subcommand, method, or agent by that name. \
+         Run it inside the guest with `wrap -- {first} ...`."
+    )
+}
+
+/// Whether the raw command line separates wrap's own arguments from the
+/// guest command with `--`. Guest words after the separator run verbatim.
+fn has_explicit_separator() -> bool {
+    has_separator(std::env::args_os().skip(1))
+}
+
+fn has_separator(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter().any(|arg| arg == "--")
+}
+
+/// `wrap log`: surface the guest's blocked network requests without
+/// booting a VM, from this workspace's session diagnostics. Two signals:
+/// explicit policy denials the sandbox logs (DNS "denied by network
+/// policy", TCP/TLS "denied by domain policy", SNI mismatches — only
+/// logged when an explicit rule denies, which needs debug diagnostics,
+/// enabled for sessions at creation), and guest DNS lookups for names
+/// the effective policy leaves unreachable (covers the silent
+/// default-deny refusals). The full firehose stays behind
+/// `msb logs <session>`.
+async fn run_log(cwd: &Path, explicit: Option<&Path>, tail: usize, follow: bool) -> Result<u8> {
+    let name = sandbox_name(cwd)?;
+    let sandbox = Sandbox::get(&name)
+        .await
+        .with_context(|| format!("no wrap session for {}", cwd.display()))?;
+    let opts = LogOptions {
+        sources: vec![LogSource::System],
+        tail: None,
+        since: None,
+        until: None,
+    };
+    // Reachability judging needs the resolved secrets, but a broken secret
+    // setup must not block reading the raw denials.
+    let policy = config::load_full(cwd, explicit)
+        .and_then(|loaded| {
+            config::resolve_secrets(&loaded.config).map(|secrets| (loaded.config, secrets))
+        })
+        .ok();
+    if follow {
+        let mut seen = 0usize;
+        let mut shown_unreachable = std::collections::BTreeSet::new();
+        loop {
+            let entries = system_entries(&sandbox, &opts).await?;
+            (seen, _) =
+                print_new_log_hits(&entries, &policy, seen, &mut shown_unreachable, usize::MAX);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+    let entries = system_entries(&sandbox, &opts).await?;
+    let mut shown_unreachable = std::collections::BTreeSet::new();
+    let (_, printed) = print_new_log_hits(&entries, &policy, 0, &mut shown_unreachable, tail);
+    if printed == 0 {
+        println!("no denied requests in {name}'s logs");
+    }
+    Ok(0)
+}
+
+/// Print denial lines and unreachable lookups in `entries[seen..]`.
+/// Returns the new high-water mark plus how many lines printed. Denials
+/// print newest-last capped at `tail`; each unreachable name prints once,
+/// on first sight.
+fn print_new_log_hits(
+    entries: &[(String, String)],
+    policy: &Option<(config::Config, config::ResolvedSecrets)>,
+    seen: usize,
+    shown_unreachable: &mut std::collections::BTreeSet<String>,
+    tail: usize,
+) -> (usize, usize) {
+    let fresh = entries.get(seen.min(entries.len())..).unwrap_or(&[]);
+    let denied: Vec<&(String, String)> = fresh
+        .iter()
+        .filter(|(_, body)| is_denial_line(body))
+        .collect();
+    let start = denied.len().saturating_sub(tail);
+    let mut printed = 0;
+    for (timestamp, body) in &denied[start..] {
+        println!("{timestamp} {}", body.trim());
+        printed += 1;
+    }
+    if let Some((cfg, secrets)) = policy {
+        let mut unreachable: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, body) in fresh {
+            for name in dns_lookup_names(body) {
+                if !config::is_host_reachable(cfg, secrets, &name) {
+                    unreachable.insert(name);
+                }
+            }
+        }
+        for name in unreachable.difference(shown_unreachable) {
+            println!("looked up but unreachable: {name}");
+            printed += 1;
+        }
+        shown_unreachable.extend(unreachable);
+    }
+    (entries.len(), printed)
+}
+
+async fn system_entries(
+    sandbox: &SandboxHandle,
+    opts: &LogOptions,
+) -> Result<Vec<(String, String)>> {
+    let entries = sandbox.logs(opts).await?;
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                String::from_utf8_lossy(&entry.data).into_owned(),
+            )
+        })
+        .collect())
+}
+
+/// Guest DNS lookups visible in session diagnostics: upstream query lines
+/// (`name: Name("example.com.")`) and dig-style question echoes
+/// (`;; example.com. IN A`). Lowercased, undotted, in first-seen order.
+fn dns_lookup_names(body: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("Name(\"") {
+        rest = &rest[start + 6..];
+        if let Some(end) = rest.find('"') {
+            push_lookup_name(&mut names, &rest[..end]);
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(question) = line.strip_prefix(";;") {
+            let mut parts = question.split_whitespace();
+            if let (Some(name), Some(_), Some(_)) = (parts.next(), parts.next(), parts.next()) {
+                push_lookup_name(&mut names, name);
+            }
+        }
+    }
+    names
+}
+
+fn push_lookup_name(names: &mut Vec<String>, raw: &str) {
+    let name = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if name.contains('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        && !names.iter().any(|existing| existing == &name)
+    {
+        names.push(name);
+    }
+}
+
+/// Matches the denial diagnostics microsandbox emits: DNS lookups refused
+/// by the network policy, TCP/TLS egress refused by the domain policy,
+/// and TLS handshakes killed on SNI/authority mismatch.
+fn is_denial_line(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("denied by domain policy")
+        || lower.contains("denied by network policy")
+        || lower.contains("did not match connect authority")
+}
+
 #[derive(Debug)]
 struct BuildStage {
     id: String,
@@ -223,7 +521,7 @@ fn build_stages(cfg: &config::Config) -> Result<Vec<BuildStage>> {
     );
 
     let mut lineage = Sha256::new();
-    lineage.update(cfg.image.as_bytes());
+    lineage.update(cfg.sandbox.image.as_bytes());
     Ok(definitions
         .into_iter()
         .enumerate()
@@ -282,7 +580,12 @@ fn mise_install_package(package: &str) -> Result<String> {
 ///
 /// The guarded chown is a transition aid for base images that still ship
 /// /opt/mise root-owned; it is a no-op on current images.
+///
+/// GitHub authentication for mise (and friends) comes first via
+/// [`mise_github_auth_snippet`], so even the earliest tool fetch in a
+/// stage sees an authenticated token.
 fn build_script(body: &str) -> String {
+    let auth = mise_github_auth_snippet();
     format!(
         "set -eu\nexport HOME={GUEST_HOME}\nexport USER={GUEST_USER}\n\
          export MISE_DATA_DIR={MISE_DATA_DIR}\nexport MISE_CONFIG_DIR={MISE_CONFIG_DIR}\n\
@@ -291,7 +594,39 @@ fn build_script(body: &str) -> String {
          export PATH=\"/usr/local/bin:{MISE_DATA_DIR}/shims:/opt/wrap/bin:\
          /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n\
          [ -O {MISE_DATA_DIR} ] || sudo -n chown -R \"$(id -u):$(id -g)\" /opt/mise\n\
+         {auth}\
          {body}\n"
+    )
+}
+
+/// Shell (POSIX sh and zsh) that gives GitHub API clients a token as early
+/// as possible: prefer a real one from `gh` when the guest has it,
+/// otherwise alias the injected `GH_TOKEN` stand-in — microsandbox
+/// substitutes the real value on matching egress, so `GITHUB_TOKEN` (the
+/// name mise reads) authenticates without ever holding the secret.
+/// Never clobbers an already-set `GITHUB_TOKEN`, and no-ops when neither
+/// source exists. Safe under `set -eu`.
+fn mise_github_auth_snippet() -> String {
+    let stand_in = config::SECRET_PLACEHOLDER;
+    format!(
+        "# Authenticate GitHub API clients (mise and friends) first: prefer a\n\
+         # real token from gh when it has one, else alias the injected\n\
+         # GH_TOKEN stand-in (substituted with the real value on matching\n\
+         # egress).\n\
+         if [ -z \"${{GITHUB_TOKEN:-}}\" ]; then\n\
+         if command -v gh >/dev/null 2>&1; then\n\
+         _wrap_gh_token=\"$(gh auth token 2>/dev/null)\" || _wrap_gh_token=\"\"\n\
+         case \"$_wrap_gh_token\" in\n\
+         \"\"|\"{stand_in}\") ;;\n\
+         *) GITHUB_TOKEN=\"$_wrap_gh_token\"; export GITHUB_TOKEN ;;\n\
+         esac\n\
+         unset _wrap_gh_token\n\
+         fi\n\
+         if [ -z \"${{GITHUB_TOKEN:-}}\" ] && [ -n \"${{GH_TOKEN:-}}\" ]; then\n\
+         GITHUB_TOKEN=\"$GH_TOKEN\"\n\
+         export GITHUB_TOKEN\n\
+         fi\n\
+         fi\n"
     )
 }
 
@@ -358,7 +693,23 @@ async fn ensure_base_snapshot(
 ///
 /// Published ports are part of the sandbox spec and cannot change on a live
 /// VM, so they are folded in too: editing `network.ports` recreates the session.
-async fn base_layout_identity(base_snapshot: &str, cfg: &config::Config) -> Result<String> {
+///
+/// The same goes for everything else baked at session creation: the network
+/// allow/deny lists and the resolved secret structure (names, headers,
+/// hosts, and which optionals were skipped) plus each agent's host-copy
+/// mapping. Editing any of it recreates the session on next entry — config
+/// drift can never leave a stale policy or copy behind. Rotated secret
+/// values are the exception: they converge live via `modify` (see
+/// `rotate_changed_secrets`) and never force a recreate.
+///
+/// Live-applied settings are deliberately excluded: guest `env` and the IPv4
+/// preference are rewritten on every entry, and cpus/memory are enforced on
+/// resume, so they need no recreate.
+async fn base_layout_identity(
+    base_snapshot: &str,
+    cfg: &config::Config,
+    secrets: &config::ResolvedSecrets,
+) -> Result<String> {
     let snapshot = Snapshot::open(base_snapshot)
         .await
         .with_context(|| format!("open base snapshot {base_snapshot}"))?;
@@ -373,7 +724,109 @@ async fn base_layout_identity(base_snapshot: &str, cfg: &config::Config) -> Resu
         identity.push_str(";ports=");
         identity.push_str(&ports.join(","));
     }
+    identity.push_str(";session=");
+    identity.push_str(&session_config_digest(cfg, secrets));
     Ok(identity)
+}
+
+/// Rotate changed secret values into a reused session without recreating
+/// it. Only values converge here: any structural drift (names, hosts,
+/// headers, skipped set) already forced a recreate via the layout digest,
+/// so every secret below exactly matches a registered one and a full
+/// re-declare only ever rotates material or no-ops. Removal is impossible
+/// through this path (omitted secrets are never removed); deletions recreate
+/// via the digest instead. A rotation failure is the caller's to report, not
+/// to die on: the session stays usable on its previous credential.
+async fn rotate_changed_secrets(
+    sandbox: &Sandbox,
+    current_values: Option<&str>,
+    secrets: &config::ResolvedSecrets,
+) -> Result<()> {
+    let digest = secret_values_digest(secrets);
+    if current_values == Some(digest.as_str()) {
+        return Ok(());
+    }
+    let mut modification = sandbox.modify();
+    for secret in &secrets.found {
+        let env = secret.env.clone();
+        let value = secret.value.clone();
+        let hosts = secret.hosts.clone();
+        modification = modification.secret(|mut patch| {
+            patch = patch
+                .env(env)
+                .value(value)
+                .placeholder(config::SECRET_PLACEHOLDER);
+            for host in &hosts {
+                patch = patch.allow_host(host.clone());
+            }
+            patch
+        });
+    }
+    modification
+        .label(SECRET_VALUES_LABEL, digest)
+        .apply()
+        .await?;
+    Ok(())
+}
+
+fn session_config_digest(cfg: &config::Config, secrets: &config::ResolvedSecrets) -> String {
+    let mut digest = Sha256::new();
+    let mut field = |tag: &str, values: &[String]| {
+        digest.update(tag.as_bytes());
+        digest.update([0]);
+        for value in values {
+            digest.update(value.as_bytes());
+            digest.update([0]);
+        }
+    };
+    field(
+        "allow-everything",
+        &[cfg.network.allow_everything.to_string()],
+    );
+    // Runtime log level rides the session identity so existing sessions
+    // recreate once and pick up denial diagnostics for `wrap log`.
+    field("runtime-log-level", &["debug".to_string()]);
+    field("allow", &cfg.network.allow);
+    field("deny", &cfg.network.deny);
+    for secret in &secrets.found {
+        field("secret-env", &[secret.env.clone()]);
+        field(
+            "secret-headers",
+            &secret
+                .headers
+                .iter()
+                .flat_map(|(name, value)| [name.clone(), value.clone()])
+                .collect::<Vec<_>>(),
+        );
+        field("secret-hosts", &secret.hosts);
+    }
+    field("skipped", &secrets.skipped.clone());
+    for agent in &cfg.agents {
+        field(
+            "agent",
+            &[
+                agent.name.clone(),
+                agent.host_copy.clone().unwrap_or_default(),
+                agent.guest.clone().unwrap_or_default(),
+            ],
+        );
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// Hash of live secret names + values, stored as a session label. A
+/// mismatch means values rotated since creation; `modify` applies the new
+/// material live, so rotation never recreates the session. Values only ever
+/// appear as hash material, never as label text.
+fn secret_values_digest(secrets: &config::ResolvedSecrets) -> String {
+    let mut digest = Sha256::new();
+    for secret in &secrets.found {
+        digest.update(secret.env.as_bytes());
+        digest.update([0]);
+        digest.update(secret.value.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 async fn build_layer(
@@ -387,9 +840,9 @@ async fn build_layer(
     let mut live = ui.start_layer(&stage.id);
 
     let mut builder = Sandbox::builder(&sandbox_name)
-        .cpus(cfg.build.cpus)
-        .memory(cfg.build.memory)
-        .max_memory(cfg.build.memory_max)
+        .cpus(cfg.sandbox.cpus)
+        .memory(cfg.sandbox.memory)
+        .max_memory(cfg.sandbox.memory_max)
         .shell("/bin/bash")
         .user(GUEST_USER)
         .env("HOME", GUEST_HOME)
@@ -403,7 +856,10 @@ async fn build_layer(
         // registry's current `latest`, not a stale local tag. Always re-checks
         // the manifest and only fetches layers whose digests changed.
         builder
-            .image_with(|i| i.oci(cfg.image.as_str()).root_disk(ROOT_DISK_GIB.gib()))
+            .image_with(|i| {
+                i.oci(cfg.sandbox.image.as_str())
+                    .root_disk(ROOT_DISK_GIB.gib())
+            })
             .pull_policy(PullPolicy::Always)
     };
     builder = apply_secrets(builder, secrets);
@@ -424,6 +880,17 @@ async fn build_layer(
         }
     };
 
+    // Build VMs share the session's broken-IPv6 host path: dual-stack names
+    // resolve v6-first and die there, so force v4-only before any stage
+    // script runs (pacman, mise, curl all hit this).
+    live.phase("disabling IPv6 egress")?;
+    if let Err(err) = ensure_ipv4_egress(&sandbox).await {
+        live.fail("network setup failed");
+        return Err(err);
+    }
+
+    // GitHub authentication for the stage rides inside the script itself
+    // (see build_script): even the earliest tool fetch runs authenticated.
     live.phase("running setup")?;
     let setup_result = run_setup(&mut live, &stage.id, &sandbox, &stage.script).await;
     if setup_result.is_ok() {
@@ -549,6 +1016,11 @@ async fn apply_session_config(
     host_copies: &[config::ResolvedHostCopy],
 ) -> Result<()> {
     let mut live = ui.start_task("session");
+    live.phase("disabling IPv6 egress")?;
+    if let Err(err) = ensure_ipv4_egress(sandbox).await {
+        live.fail("network setup failed");
+        return Err(err);
+    }
     let marker = host_copy_marker(host_copies);
     if marker.is_some()
         && !sandbox
@@ -601,6 +1073,33 @@ fn host_copy_marker(copies: &[config::ResolvedHostCopy]) -> Option<String> {
         "/var/lib/wrap/host-copy-{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3]
     ))
+}
+
+/// Guest IPv6 egress has no working upstream on these hosts: dual-stack
+/// names resolve v6-first and connections die there (resets on some
+/// upstreams, blackholes on others) while IPv4 answers instantly. Disable
+/// IPv6 so every runtime resolves and connects v4-only; localhost keeps
+/// working over 127.0.0.1. Not persisted to any snapshot — applied at every
+/// session entry, and a reboot clears it.
+fn ipv6_disable_script() -> String {
+    "set -eu\necho 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6\n\
+     echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6\n"
+        .to_string()
+}
+
+async fn ensure_ipv4_egress(sandbox: &Sandbox) -> Result<()> {
+    let output = root_shell(sandbox, ipv6_disable_script())
+        .await
+        .context("disable guest IPv6 egress")?;
+    if !output.status().success {
+        let stderr = String::from_utf8_lossy(output.stderr_bytes());
+        bail!(
+            "disable guest IPv6 egress exited {}: {}",
+            output.status().code,
+            stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 /// Run a script as guest root regardless of the sandbox's default user.
@@ -791,8 +1290,9 @@ async fn install_agent_shims(sandbox: &Sandbox, cfg: &config::Config) -> Result<
 /// Realign the guest `user` uid/gid with the host owner of the workspace.
 ///
 /// The workspace is a virtiofs bind mount with stat virtualization off, so the
-/// guest sees literal host ownership. Matching ids is what makes /workspace
-/// writable for the unprivileged session without chowning host files (which
+/// guest sees literal host ownership. Matching ids is what makes the
+/// workspace mount writable for the unprivileged session without chowning
+/// host files (which
 /// would otherwise leave `user.msb.override_stat` xattrs on every file).
 async fn align_guest_identity(sandbox: &Sandbox, identity: HostIdentity) -> Result<()> {
     let script = format!(
@@ -881,12 +1381,9 @@ async fn open_or_create_session(
         live.phase("replacing vm")?;
         CrossingKind::Reset
     } else if let Ok(existing) = Sandbox::get(name).await {
-        let current_base = existing
-            .config()?
-            .spec
-            .labels
-            .get(BASE_LAYOUT_LABEL)
-            .cloned();
+        let labels = &existing.config()?.spec.labels;
+        let current_base = labels.get(BASE_LAYOUT_LABEL).cloned();
+        let current_values = labels.get(SECRET_VALUES_LABEL).cloned();
         if current_base.as_deref() != Some(base_layout) {
             ui.setting_up_project();
             live.phase("updating base layout")?;
@@ -902,6 +1399,11 @@ async fn open_or_create_session(
                     return Err(err);
                 }
             };
+            if let Err(err) =
+                rotate_changed_secrets(&sandbox, current_values.as_deref(), secrets).await
+            {
+                ui.warn(&format!("secret rotation failed: {err:#}"));
+            }
             live.done();
             return Ok((sandbox, CrossingKind::Reused));
         }
@@ -1013,12 +1515,16 @@ async fn create_session(
     let outer_pwd_base = workspace_base(cwd);
     let guest_host = workspace_base(cwd);
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
-    let policy = session_policy(cfg)?;
+    let policy = session_policy(cfg, secrets)?;
     let identity = host_identity(cwd)?;
     let user = guest_user(identity);
 
     let mut builder = Sandbox::builder(name)
         .from_snapshot(base_snapshot)
+        // Debug runtime diagnostics persist the network policy denials
+        // (`wrap log` reads them); without this only info and above reach
+        // the session logs.
+        .log_level(LogLevel::Debug)
         .cpus(resources.cpus)
         .memory(resources.memory)
         .max_memory(resources.memory_max)
@@ -1027,6 +1533,7 @@ async fn create_session(
         .hostname(&guest_host)
         .replace()
         .label(BASE_LAYOUT_LABEL, base_layout)
+        .label(SECRET_VALUES_LABEL, secret_values_digest(secrets))
         .user(user)
         .env("HOME", guest_home(identity))
         .env("USER", user)
@@ -1062,6 +1569,56 @@ async fn create_session(
     Ok(sandbox)
 }
 
+/// Everything the session exposes to the guest, printed at entry.
+fn exposure_report(
+    cfg: &config::Config,
+    secrets: &config::ResolvedSecrets,
+    copies: &[config::ResolvedHostCopy],
+    sources: &[config::ConfigSource],
+) -> ui::ExposureReport {
+    ui::ExposureReport {
+        sources: sources.iter().map(|source| source.label()).collect(),
+        allow_everything: cfg.network.allow_everything,
+        allow: config::effective_allow_hosts(cfg, secrets),
+        deny: cfg.network.deny.clone(),
+        secrets: secrets
+            .found
+            .iter()
+            .map(|secret| ui::ExposureSecret {
+                env: secret.env.clone(),
+                headers: secret
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                hosts: secret.hosts.clone(),
+            })
+            .collect(),
+        ports: cfg
+            .network
+            .ports
+            .iter()
+            .map(|port| {
+                if port.host == port.guest {
+                    port.host.to_string()
+                } else {
+                    format!("{}:{}", port.host, port.guest)
+                }
+            })
+            .collect(),
+        copies: copies
+            .iter()
+            .map(|copy| (copy.agent.clone(), copy.guest.clone()))
+            .collect(),
+        env: cfg
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        skipped: secrets.skipped.clone(),
+    }
+}
+
 fn apply_secrets(
     mut builder: microsandbox::sandbox::SandboxBuilder,
     secrets: &config::ResolvedSecrets,
@@ -1069,9 +1626,15 @@ fn apply_secrets(
     for secret in &secrets.found {
         let env = secret.env.clone();
         let value = secret.value.clone();
+        let headers = secret.headers.clone();
         let hosts = secret.hosts.clone();
         builder = builder.secret(|mut s| {
-            s = s.env(env).value(value);
+            // The guest env var holds the constant stand-in; microsandbox
+            // substitutes the real value on matching traffic.
+            s = s
+                .env(env)
+                .value(value)
+                .placeholder(config::SECRET_PLACEHOLDER);
             for host in &hosts {
                 s = if host.contains('*') {
                     s.allow_host_pattern(host)
@@ -1079,15 +1642,27 @@ fn apply_secrets(
                     s.allow_host(host)
                 };
             }
+            if !headers.is_empty() {
+                // Declared headers ride header injection as placeholder
+                // substitution; per-tool config (e.g. git's http.extraheader,
+                // written at session entry) makes guest tools send them.
+                s = s.inject_headers(true);
+            }
             s
         });
     }
     builder
 }
 
-fn session_policy(cfg: &config::Config) -> Result<NetworkPolicy, microsandbox::MicrosandboxError> {
-    let (allow_domains, allow_suffixes) = classify_hosts(&cfg.network.allow_host);
-    let (deny_domains, deny_suffixes) = classify_hosts(&cfg.network.deny_host);
+fn session_policy(
+    cfg: &config::Config,
+    secrets: &config::ResolvedSecrets,
+) -> Result<NetworkPolicy, microsandbox::MicrosandboxError> {
+    // Only live secrets whitelist their hosts here; skipped optionals add
+    // nothing, and `network.deny` already won inside `effective_allow_hosts`.
+    let allow = config::effective_allow_hosts(cfg, secrets);
+    let (allow_domains, allow_suffixes) = classify_hosts(&allow);
+    let (deny_domains, deny_suffixes) = classify_hosts(&cfg.network.deny);
     let builder = if cfg.network.allow_everything {
         NetworkPolicy::builder().default_allow()
     } else {
@@ -1137,14 +1712,17 @@ async fn enter_session(
     ui: &Ui,
     cfg: &config::Config,
     sandbox: &Sandbox,
+    secrets: &config::ResolvedSecrets,
     command: &[String],
 ) -> Result<u8> {
-    if secrets_need_git_header(command) {
-        let _ = sandbox
-            .shell(
-                r#"git config --global http.https://github.com/.extraheader "AUTHORIZATION: bearer $GITHUB_TOKEN""#,
-            )
-            .await;
+    if secrets_need_git_header(command, secrets) {
+        if let Some((name, value)) = github_extraheader(secrets) {
+            let _ = sandbox
+                .shell(format!(
+                    "git config --global http.https://github.com/.extraheader \"{name}: {value}\""
+                ))
+                .await;
+        }
     }
 
     let (cmd, args) = guest_command(cfg, command);
@@ -1174,6 +1752,10 @@ fn guest_exports(cfg: &config::Config) -> String {
         out.push('=');
         out.push_str(&shell_quote(value));
     }
+    // Session shells get the same first-thing GitHub authentication as
+    // build stages, so runtime mise installs authenticate too.
+    out.push_str("; ");
+    out.push_str(&mise_github_auth_snippet());
     out
 }
 
@@ -1199,8 +1781,26 @@ fn guest_command(cfg: &config::Config, command: &[String]) -> (String, Vec<Strin
     )
 }
 
-fn secrets_need_git_header(command: &[String]) -> bool {
-    command.first().is_none_or(|cmd| cmd != "true")
+/// The first live secret declaring an `Authorization` header for exactly
+/// `github.com` provides git's http.extraheader (header name and value
+/// template). The value references a guest env var, so the shell expands it
+/// to the stand-in at entry time and header injection substitutes the real
+/// token on the wire.
+fn github_extraheader(secrets: &config::ResolvedSecrets) -> Option<(String, String)> {
+    secrets.found.iter().find_map(|secret| {
+        if !secret.hosts.iter().any(|host| host == "github.com") {
+            return None;
+        }
+        secret
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+    })
+}
+
+fn secrets_need_git_header(command: &[String], secrets: &config::ResolvedSecrets) -> bool {
+    command.first().is_none_or(|cmd| cmd != "true") && github_extraheader(secrets).is_some()
 }
 
 fn sandbox_name(cwd: &Path) -> Result<String> {
@@ -1243,12 +1843,12 @@ fn balloon_memory(boot_mib: u32, max_mib: u32) -> (u32, u32) {
     (boot_mib, max_mib)
 }
 fn vm_resources(cli: &Cli, cfg: &config::Config) -> Result<VmResources> {
-    let cpus = cli.cpus.unwrap_or(cfg.build.cpus);
+    let cpus = cli.cpus.unwrap_or(cfg.sandbox.cpus);
     if cpus == 0 {
         bail!("VM CPU count must be greater than zero");
     }
-    let memory = cli.memory_boot.unwrap_or(cfg.build.memory);
-    let memory_max = cli.memory.unwrap_or(cfg.build.memory_max);
+    let memory = cli.memory_boot.unwrap_or(cfg.sandbox.memory);
+    let memory_max = cli.memory.unwrap_or(cfg.sandbox.memory_max);
     let (memory, memory_max) = balloon_memory(memory, memory_max);
     Ok(VmResources {
         cpus,
@@ -1287,6 +1887,51 @@ mod tests {
         assert_eq!(shell_join(&["omp".into(), "say hi".into()]), "omp 'say hi'");
     }
     #[test]
+    fn separator_detection() {
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(!has_separator(args(&[])));
+        assert!(!has_separator(args(&["--cpus", "8", "ls"])));
+        assert!(has_separator(args(&["--", "ls"])));
+        assert!(has_separator(args(&["--config", "f.yml", "--", "ls"])));
+        assert!(!has_separator(args(&["git", "log", "--oneline"])));
+    }
+
+    #[test]
+    fn lookup_name_extraction() {
+        let body = "DEBUG hickory_net::xfer: enqueueing message:QUERY:\
+            [Query { name: Name(\"Example.COM.\"), query_type: A, query_class: IN }]\n\
+            ;; Example.COM. IN A\n\
+            ;; other.net. IN AAAA";
+        assert_eq!(
+            dns_lookup_names(body),
+            vec!["example.com".to_string(), "other.net".to_string()]
+        );
+        assert!(dns_lookup_names("INFO microsandbox_runtime::vm: sandbox starting").is_empty());
+        assert!(dns_lookup_names(";; not a question").is_empty());
+        assert!(dns_lookup_names("Name(\"unterminated").is_empty());
+    }
+
+    #[test]
+    fn denial_line_matching() {
+        // Verbatim messages from microsandbox-network 0.6.16.
+        assert!(is_denial_line("DNS query denied by network policy"));
+        assert!(is_denial_line("TCP egress denied by domain policy"));
+        assert!(is_denial_line("TLS egress denied by domain policy"));
+        assert!(is_denial_line("TLS SNI did not match CONNECT authority"));
+        assert!(is_denial_line(
+            "level=DEBUG msg=\"DNS query denied by network policy\" domain=example.com"
+        ));
+        assert!(!is_denial_line("TLS bypass"));
+        assert!(!is_denial_line("sandbox started"));
+        assert!(!is_denial_line(""));
+    }
+
+    #[test]
     fn names_sandbox_from_realpath() {
         let a = sandbox_name_from_real(Path::new("/home/tobi/src/app"));
         let b = sandbox_name_from_real(Path::new("/home/tobi/src/app"));
@@ -1301,7 +1946,210 @@ mod tests {
     fn session_policy_builds_from_config() {
         let cfg: config::Config =
             serde_yaml::from_str(include_str!("../resources/default.yml")).unwrap();
-        session_policy(&cfg).expect("session policy");
+        // The default GH_TOKEN source needs `gh` auth, so exercise the
+        // policy with no live secrets: network.allow alone must build.
+        let secrets = resolved(&[]);
+        session_policy(&cfg, &secrets).expect("session policy");
+    }
+
+    #[test]
+    fn deny_overwrites_allow_for_covered_subdomain() {
+        let cfg: config::Config =
+            serde_yaml::from_str("network:\n  allow: [.github.com]\n  deny: [gist.github.com]\n")
+                .unwrap();
+        let secrets = config::resolve_secrets(&cfg).unwrap();
+        let policy = session_policy(&cfg, &secrets).expect("session policy");
+        let value = serde_yaml::to_value(&policy).expect("serialize policy");
+        let rules = value
+            .get("rules")
+            .and_then(|rules| rules.as_sequence())
+            .expect("policy serializes to a rules list");
+        let mut deny_at = None;
+        let mut allow_at = None;
+        for (index, rule) in rules.iter().enumerate() {
+            let action = rule.get("action").and_then(|action| action.as_str());
+            // Destinations serialize as tagged scalars (`!domain X`,
+            // `!domain_suffix X`); the tag is lost in `Value` form, but this
+            // fixture has exactly one rule per host string.
+            let host = rule
+                .get("destination")
+                .and_then(|destination| destination.as_str())
+                .unwrap_or("");
+            if action == Some("deny") && host == "gist.github.com" && deny_at.is_none() {
+                deny_at = Some(index);
+            }
+            if action == Some("allow") && host == "github.com" && allow_at.is_none() {
+                allow_at = Some(index);
+            }
+        }
+        let (deny_at, allow_at) = (
+            deny_at.expect("deny rule for gist.github.com"),
+            allow_at.expect("allow rule for .github.com"),
+        );
+        assert!(
+            deny_at < allow_at,
+            "deny must evaluate before allow (deny@{deny_at}, allow@{allow_at})"
+        );
+    }
+
+    #[test]
+    fn session_policy_covers_folded_secret_hosts() {
+        let cfg: config::Config = serde_yaml::from_str(
+            "network:\n  allow: [example.com]\n  deny: [blocked.example.com]\n\
+             secrets:\n  - env: TEST_TOKEN\n    source: literal\n    hosts:\n      api.example.com: {allow: true}\n      blocked.example.com: {allow: true}\n  - env: WRAP_TEST_ABSENT_THAT_MUST_NOT_EXIST\n    source: $WRAP_TEST_ABSENT_THAT_MUST_NOT_EXIST\n    optional: true\n    hosts:\n      absent.example.com: {allow: true}\n",
+        )
+        .unwrap();
+        let secrets = config::resolve_secrets(&cfg).unwrap();
+        // Building the policy is the assertion: folded hosts must not break
+        // it, deny still wins, and the skipped optional whitelists nothing.
+        session_policy(&cfg, &secrets).expect("session policy");
+        let allow = config::effective_allow_hosts(&cfg, &secrets);
+        assert!(allow.contains(&"api.example.com".to_string()));
+        assert!(!allow.contains(&"blocked.example.com".to_string()));
+        assert!(!allow.contains(&"absent.example.com".to_string()));
+    }
+
+    fn resolved(entries: &[(&str, &[(&str, &str)], &[&str])]) -> config::ResolvedSecrets {
+        config::ResolvedSecrets {
+            found: entries
+                .iter()
+                .map(|(env, headers, hosts)| config::ResolvedSecret {
+                    env: (*env).to_string(),
+                    value: "value".to_string(),
+                    headers: headers
+                        .iter()
+                        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                        .collect(),
+                    hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+                })
+                .collect(),
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn github_auth_snippet_prefers_gh_then_aliases() {
+        let snippet = mise_github_auth_snippet();
+        // gh is attempted before the stand-in alias.
+        assert!(snippet.find("gh auth token").unwrap() < snippet.find("\"$GH_TOKEN\"").unwrap());
+        // The stand-in is never mistaken for a real token.
+        assert!(snippet.contains(config::SECRET_PLACEHOLDER));
+        // A preset GITHUB_TOKEN is never clobbered.
+        assert!(snippet.contains("if [ -z \"${GITHUB_TOKEN:-}\" ]"));
+        // Both build stages and session shells run it first thing.
+        assert!(build_script("true").contains(&snippet));
+        let cfg: config::Config =
+            serde_yaml::from_str(include_str!("../resources/default.yml")).unwrap();
+        assert!(guest_exports(&cfg).contains(&snippet));
+    }
+
+    /// Run the generated snippet through a real shell: without `gh` on
+    /// PATH it must alias `$GH_TOKEN` (even the stand-in), keep a preset
+    /// `GITHUB_TOKEN`, and stay silent when there is nothing to alias.
+    fn snippet_github_token(gh_token: Option<&str>, github_token: Option<&str>) -> String {
+        let probe = format!(
+            "{}printf '%s' \"${{GITHUB_TOKEN:-unset}}\"",
+            mise_github_auth_snippet()
+        );
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(&probe).env_clear();
+        match gh_token {
+            Some(value) => {
+                command.env("GH_TOKEN", value);
+            }
+            None => {
+                command.env_remove("GH_TOKEN");
+            }
+        }
+        match github_token {
+            Some(value) => {
+                command.env("GITHUB_TOKEN", value);
+            }
+            None => {
+                command.env_remove("GITHUB_TOKEN");
+            }
+        }
+        let output = command.output().expect("run snippet under sh");
+        assert!(
+            output.status.success(),
+            "snippet must survive set-less sh, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn github_auth_snippet_aliases_stand_in_without_gh() {
+        assert_eq!(
+            snippet_github_token(Some(config::SECRET_PLACEHOLDER), None),
+            config::SECRET_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn github_auth_snippet_keeps_preset_and_stays_quiet() {
+        assert_eq!(
+            snippet_github_token(Some("live-value"), Some("preset")),
+            "preset"
+        );
+        assert_eq!(snippet_github_token(None, None), "unset");
+    }
+
+    #[test]
+    fn github_auth_snippet_survives_set_eu() {
+        // Build stages run under `set -eu`: a missing gh, an empty token,
+        // and missing variables must all still exit zero.
+        let probe = format!(
+            "set -eu\n{}printf '%s' \"${{GITHUB_TOKEN:-unset}}\"",
+            mise_github_auth_snippet()
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&probe)
+            .env_clear()
+            .output()
+            .expect("run snippet under sh -eu");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "unset");
+    }
+
+    #[test]
+    fn git_extraheader_comes_from_declared_authorization() {
+        let live = resolved(&[(
+            "GH_TOKEN",
+            &[("Authorization", "Bearer $GH_TOKEN")],
+            &["github.com"],
+        )]);
+        assert!(secrets_need_git_header(&[], &live));
+        assert_eq!(
+            github_extraheader(&live),
+            Some(("Authorization".to_string(), "Bearer $GH_TOKEN".to_string()))
+        );
+        assert!(!secrets_need_git_header(&["true".to_string()], &live));
+        // No secrets, no Authorization header, or no github.com host.
+        assert!(!secrets_need_git_header(&[], &resolved(&[])));
+        let no_header = resolved(&[("GH_TOKEN", &[], &["github.com"])]);
+        assert!(!secrets_need_git_header(&[], &no_header));
+        let elsewhere = resolved(&[(
+            "OTHER",
+            &[("Authorization", "Bearer $OTHER")],
+            &["api.example.com"],
+        )]);
+        assert!(!secrets_need_git_header(&[], &elsewhere));
+        // Header name matching is case-insensitive; first match wins.
+        let lower = resolved(&[(
+            "GH_TOKEN",
+            &[("authorization", "Bearer $GH_TOKEN")],
+            &["github.com"],
+        )]);
+        assert_eq!(
+            github_extraheader(&lower),
+            Some(("authorization".to_string(), "Bearer $GH_TOKEN".to_string()))
+        );
     }
 
     #[test]
@@ -1393,6 +2241,80 @@ mod tests {
     }
 
     #[test]
+    fn network_allow_everything_flag_parses() {
+        let cli =
+            Cli::try_parse_from(["wrap", "--network-allow-everything", "--", "/bin/true"]).unwrap();
+        assert!(cli.network_allow_everything);
+        let cli = Cli::try_parse_from(["wrap", "--yolo", "--", "/bin/true"]).unwrap();
+        assert!(cli.network_allow_everything);
+        let cli = Cli::try_parse_from(["wrap", "--", "/bin/true"]).unwrap();
+        assert!(!cli.network_allow_everything);
+    }
+
+    #[test]
+    fn allow_everything_override_changes_session_identity() {
+        // The temporary flag must move the session digest so the open
+        // session recreates — and recreates back without it.
+        let mut cfg: config::Config =
+            serde_yaml::from_str("network:\n  allow_everything: false\n").unwrap();
+        let secrets = config::resolve_secrets(&cfg).unwrap();
+        let denied = session_config_digest(&cfg, &secrets);
+        cfg.network.allow_everything = true;
+        let open = session_config_digest(&cfg, &secrets);
+        assert_ne!(denied, open);
+    }
+
+    #[test]
+    fn allow_subcommand_parses_host_and_scope() {
+        let cli = Cli::try_parse_from(["wrap", "allow", "example.com"]).unwrap();
+        match &cli.subcommand {
+            Some(Subcommand::Allow { host, global }) => {
+                assert_eq!(host, "example.com");
+                assert!(!global);
+            }
+            other => panic!("unexpected subcommand {other:?}"),
+        }
+        let cli =
+            Cli::try_parse_from(["wrap", "-c", "dir", "allow", "-g", ".example.com"]).unwrap();
+        match &cli.subcommand {
+            Some(Subcommand::Allow { host, global }) => {
+                assert_eq!(host, ".example.com");
+                assert!(global);
+            }
+            other => panic!("unexpected subcommand {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["wrap", "allow"]).is_err());
+    }
+
+    #[test]
+    fn init_subcommand_wins_over_guest_command() {
+        let cli = Cli::try_parse_from(["wrap", "init"]).unwrap();
+        assert!(matches!(cli.subcommand, Some(Subcommand::Init)));
+        assert!(cli.command.is_empty());
+        // `--` escapes the subcommand: this runs `init` inside the guest.
+        let cli = Cli::try_parse_from(["wrap", "--", "init"]).unwrap();
+        assert!(cli.subcommand.is_none());
+        assert_eq!(cli.command, ["init".to_string()]);
+    }
+
+    #[test]
+    fn config_subcommand_dumps_without_taking_the_overlay_flag() {
+        let cli = Cli::try_parse_from(["wrap", "config"]).unwrap();
+        assert!(matches!(cli.subcommand, Some(Subcommand::Config)));
+        assert!(cli.config.is_none());
+        // Overlay path stays `--config FILE`; dump is the subcommand.
+        let cli = Cli::try_parse_from(["wrap", "--config", "extra.yml", "config"]).unwrap();
+        assert!(matches!(cli.subcommand, Some(Subcommand::Config)));
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("extra.yml"))
+        );
+        let cli = Cli::try_parse_from(["wrap", "--", "config"]).unwrap();
+        assert!(cli.subcommand.is_none());
+        assert_eq!(cli.command, ["config".to_string()]);
+    }
+
+    #[test]
     fn lifecycle_flags_bypass_fast_methods() {
         let command = ["bash".to_string(), "true".to_string()];
         assert!(fast_method(false, false, &command).is_some());
@@ -1438,6 +2360,63 @@ mod tests {
             "/usr/local/bin:/home/user/.local/bin:/opt/mise/data/shims:/opt/wrap/bin:/usr/bin:/bin"
         );
         assert_eq!(run(&once), once, "second application must not stack");
+    }
+
+    #[test]
+    fn session_digest_tracks_session_config() {
+        let cfg: config::Config = serde_yaml::from_str(
+            "network:\n  allow: [example.com]\n\
+             secrets:\n  - env: TEST_TOKEN\n    source: literal\n    headers:\n      X-Api-Token: $TEST_TOKEN\n    hosts:\n      api.example.com: {allow: true}\n\
+             agents:\n  - name: pi\n    package: mise:pi@latest\n    host-copy: ~/.pi\n",
+        )
+        .unwrap();
+        let secrets = config::resolve_secrets(&cfg).unwrap();
+        let base = session_config_digest(&cfg, &secrets);
+        // Deterministic.
+        assert_eq!(base, session_config_digest(&cfg, &secrets));
+        // Network drift changes it.
+        let mut changed = serde_yaml::from_str::<config::Config>(
+            "network:\n  allow: [example.com, other.example.com]\n",
+        )
+        .unwrap();
+        changed.secrets = cfg.secrets.clone();
+        changed.agents = cfg.agents.clone();
+        let changed_secrets = config::resolve_secrets(&changed).unwrap();
+        assert_ne!(base, session_config_digest(&changed, &changed_secrets));
+        // A rotated secret value leaves the structural digest alone ...
+        let rotated = cfg.clone();
+        let mut rotated_secrets = secrets.clone();
+        rotated_secrets.found[0].value = "rotated".to_string();
+        assert_eq!(base, session_config_digest(&rotated, &rotated_secrets));
+        // ... while the values digest changes without ever naming the value.
+        let values = secret_values_digest(&rotated_secrets);
+        assert_ne!(values, secret_values_digest(&secrets));
+        assert!(!values.contains("rotated"));
+        // A newly resolvable optional changes it.
+        assert_ne!(
+            base,
+            session_config_digest(
+                &cfg,
+                &config::ResolvedSecrets {
+                    found: secrets.found.clone(),
+                    skipped: vec!["EXTRA".to_string()],
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn ipv6_disable_script_targets_proc_sys() {
+        let script = ipv6_disable_script();
+        assert!(script.contains("/proc/sys/net/ipv6/conf/all/disable_ipv6"));
+        assert!(script.contains("/proc/sys/net/ipv6/conf/default/disable_ipv6"));
+        assert!(
+            std::process::Command::new("/bin/sh")
+                .args(["-n", "-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]

@@ -61,10 +61,12 @@ RUN printf '%s\n' 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /e
       fd \
       gdb \
       git \
+      github-cli \
       gnupg \
       jq \
       libyaml \
       mise \
+      nano \
       ninja \
       openssh \
       python \
@@ -78,7 +80,7 @@ RUN printf '%s\n' 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /e
       which \
       zsh \
       starship \
- && install -d /opt/mise /opt/wrap/bin /workspace /etc/wrap \
+ && install -d /opt/mise /opt/wrap/bin /etc/wrap \
  && /usr/bin/mise self-update --yes || true \
  && /usr/bin/mise use --global --pin --yes --jobs 4 -- \
       rust@latest \
@@ -87,6 +89,7 @@ RUN printf '%s\n' 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /e
       node@latest \
       pnpm@latest \
       python@latest \
+      uv@latest \
  && if ! grep -qx '/bin/zsh' /etc/shells; then echo /bin/zsh >> /etc/shells; fi \
  && if ! grep -qx '/usr/bin/zsh' /etc/shells; then echo /usr/bin/zsh >> /etc/shells; fi \
  && (chsh -s /bin/zsh root || true) \
@@ -96,8 +99,8 @@ RUN printf '%s\n' 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /e
 
 # ---------------------------------------------------------------------------
 # Unprivileged `user` (uid/gid 1000) with passwordless sudo.
-# /workspace is owned by that uid so the default bind-mount target is writable
-# in user mode without any host-side chown.
+# The project bind-mounts at ${WRAP_USER_HOME}/workspace, owned by that uid
+# so it is writable in user mode without any host-side chown.
 # /opt/mise is owned by that uid too: the toolchain lives at a HOME-independent
 # path, but `user` must be able to `mise use`/`mise install` into it without
 # sudo. root still reads it fine (a+rX).
@@ -111,7 +114,8 @@ RUN groupadd -g "${WRAP_GID}" "${WRAP_USER_NAME}" 2>/dev/null || true \
  && printf '%%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/11-wrap-wheel \
  && chmod 0440 /etc/sudoers.d/10-wrap-user /etc/sudoers.d/11-wrap-wheel \
  && visudo -c \
- && chown -R "${WRAP_UID}:${WRAP_GID}" "${WRAP_USER_HOME}" /workspace /opt/mise \
+ && install -d -o "${WRAP_UID}" -g "${WRAP_GID}" "${WRAP_USER_HOME}/workspace" \
+ && chown -R "${WRAP_UID}:${WRAP_GID}" "${WRAP_USER_HOME}" /opt/mise \
  && chmod 0755 "${WRAP_USER_HOME}"
 
 # ---------------------------------------------------------------------------
@@ -164,7 +168,7 @@ RUN cat > /etc/wrap/skel.profile <<'EOF'
 [ -f /etc/profile.d/wrap.sh ] && . /etc/profile.d/wrap.sh
 EOF
 
-# `safe.directory = *` is deliberate: /workspace is a bind mount whose host
+# `safe.directory = *` is deliberate: the project is a bind mount whose host
 # owner uid frequently differs from the in-container uid, and git otherwise
 # aborts every command with "detected dubious ownership in repository".
 RUN cat > /etc/wrap/skel.gitconfig <<'EOF'
@@ -275,6 +279,6 @@ RUN chmod 0755 /opt/wrap/bin/wrap-entrypoint
 ENV HOME=/home/user \
     USER=user
 
-WORKDIR /workspace
+WORKDIR /home/user/workspace
 ENTRYPOINT ["/opt/wrap/bin/wrap-entrypoint"]
 CMD ["/bin/zsh", "-l"]

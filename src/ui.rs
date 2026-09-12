@@ -197,36 +197,8 @@ impl Ui {
         let _ = writeln!(io::stderr(), "{line}");
     }
 
-    pub fn secret_access(&self, secrets: &[(&str, &[String])]) {
-        let _ = writeln!(
-            io::stderr(),
-            "no secrets are exposed to the VM directly, but it can use the following pseudo tokens with the following hosts:"
-        );
-        if secrets.is_empty() {
-            let _ = writeln!(io::stderr(), "  (none)");
-            return;
-        }
-        for (env, hosts) in secrets.iter().take(4) {
-            let hosts = hosts
-                .iter()
-                .map(|host| sanitize(host))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(
-                io::stderr(),
-                "  {}: {}",
-                self.theme.muted(&hosts),
-                self.theme.primary(&sanitize(env))
-            );
-        }
-        if secrets.len() > 4 {
-            let _ = writeln!(
-                io::stderr(),
-                "  {}",
-                self.theme
-                    .muted(&format!("[... and {} more]", secrets.len() - 4))
-            );
-        }
+    pub fn exposures(&self, report: &ExposureReport) {
+        let _ = writeln!(io::stderr(), "{}", format_exposures(self.theme, report));
     }
 
     pub fn attached(&self) {
@@ -238,6 +210,14 @@ impl Ui {
             io::stderr(),
             "{}",
             format_stop_failed(self.theme, &err.to_string())
+        );
+    }
+
+    pub fn warn(&self, msg: &str) {
+        let _ = writeln!(
+            io::stderr(),
+            "{}",
+            self.theme.warn(&format!("warning: {msg}"))
         );
     }
 
@@ -898,6 +878,162 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Everything a wrap session exposes to the guest, printed at entry.
+pub struct ExposureReport {
+    /// Merge stack that produced this session config, already labeled.
+    pub sources: Vec<String>,
+    /// True when egress is allow-by-default (dangerous); false when
+    /// default-deny (safe).
+    pub allow_everything: bool,
+    /// Effective reachable hosts: `network.allow` plus the hosts of live
+    /// secrets only, minus `network.deny`.
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub secrets: Vec<ExposureSecret>,
+    pub ports: Vec<String>,
+    pub copies: Vec<(String, String)>,
+    pub env: Vec<(String, String)>,
+    /// Optional secrets whose host source was absent.
+    pub skipped: Vec<String>,
+}
+
+/// One live secret: the guest holds `NOT-AN-ACTUAL-KEY`, never the real value.
+pub struct ExposureSecret {
+    pub env: String,
+    pub headers: Vec<(String, String)>,
+    pub hosts: Vec<String>,
+}
+
+/// One indented credential line per declared header. A secret with no
+/// headers declares no send path.
+fn attach_lines(secret: &ExposureSecret) -> Vec<String> {
+    if secret.headers.is_empty() {
+        return vec![format!(
+            "{}: no headers declared (guest does not see this token)",
+            sanitize(&secret.env),
+        )];
+    }
+    secret
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "{}: {}: {} (guest does not see this token)",
+                sanitize(&secret.env),
+                sanitize(name),
+                sanitize(value),
+            )
+        })
+        .collect()
+}
+
+pub fn format_exposures(theme: Theme, report: &ExposureReport) -> String {
+    let mut out = String::new();
+    if !report.sources.is_empty() {
+        out.push_str("config:\n");
+        for source in &report.sources {
+            out.push_str(&format!("  {}\n", theme.primary(&sanitize(source))));
+        }
+    }
+    let access = if report.allow_everything {
+        theme.danger("allow")
+    } else {
+        theme.ok("deny")
+    };
+    out.push_str(&format!("network-access: {access}\n"));
+    if report.allow.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    // Hosts sharing the exact same credential attachments print as one
+    // comma-separated line. Bare hosts share a line too.
+    let mut groups: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    for host in &report.allow {
+        let mut attached = Vec::new();
+        for secret in &report.secrets {
+            if secret.hosts.iter().any(|h| h == host) {
+                attached.extend(attach_lines(secret));
+            }
+        }
+        if attached.is_empty() {
+            if let Some(group) = groups.iter_mut().find(|(_, lines)| lines.is_empty()) {
+                group.0.push(host.clone());
+            } else {
+                groups.push((vec![host.clone()], Vec::new()));
+            }
+        } else if let Some(group) = groups.iter_mut().find(|(_, lines)| *lines == attached) {
+            group.0.push(host.clone());
+        } else {
+            groups.push((vec![host.clone()], attached));
+        }
+    }
+    for (hosts, lines) in &groups {
+        out.push_str(&format!(
+            "  {}\n",
+            theme.primary(&sanitize(&hosts.join(", ")))
+        ));
+        for line in lines {
+            out.push_str(&format!("    {}\n", theme.muted(line)));
+        }
+    }
+    // Live secrets with no reachable host (every host denied) would
+    // otherwise vanish from the report.
+    for secret in &report.secrets {
+        if !secret.hosts.is_empty()
+            && !secret
+                .hosts
+                .iter()
+                .any(|host| report.allow.iter().any(|allow| allow == host))
+        {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                theme.primary(&sanitize(&secret.env)),
+                theme.muted("no reachable hosts (all denied)"),
+            ));
+        }
+    }
+    let mut deny: Vec<String> = report.deny.iter().map(|host| sanitize(host)).collect();
+    if !report.allow_everything {
+        deny.push("everything else".to_string());
+    }
+    if !deny.is_empty() {
+        out.push_str(&format!("  deny: {}\n", theme.muted(&deny.join(", "))));
+    }
+    if !report.ports.is_empty() {
+        out.push_str(&format!(
+            "ports: {}\n",
+            theme.primary(&sanitize(&report.ports.join(", ")))
+        ));
+    }
+    if !report.copies.is_empty() {
+        let copies = report
+            .copies
+            .iter()
+            .map(|(agent, guest)| format!("{} -> {}", sanitize(agent), sanitize(guest)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("copies: {}\n", theme.primary(&copies)));
+    }
+    if !report.env.is_empty() {
+        let env = report
+            .env
+            .iter()
+            .map(|(key, value)| format!("{}={}", sanitize(key), sanitize(value)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        out.push_str(&format!("env: {}\n", theme.muted(&env)));
+    }
+    if !report.skipped.is_empty() {
+        let names = report
+            .skipped
+            .iter()
+            .map(|name| sanitize(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("skip: {}\n", theme.muted(&names)));
+    }
+    out
+}
+
 pub fn sanitize(s: &str) -> String {
     strip_ansi(s).chars().filter(|c| !c.is_control()).collect()
 }
@@ -1131,5 +1267,134 @@ mod tests {
         }
         assert_eq!(buf.history().count(), HISTORY_CAP);
         assert_eq!(buf.history().next(), Some("line-32"));
+    }
+
+    fn exposure_fixture(allow_everything: bool) -> ExposureReport {
+        ExposureReport {
+            sources: vec![
+                "embedded defaults".to_string(),
+                "~/.config/wrap/config.yml".to_string(),
+            ],
+            allow_everything,
+            allow: vec!["github.com".to_string(), "mise.run".to_string()],
+            deny: vec!["blocked.example.com".to_string()],
+            secrets: vec![ExposureSecret {
+                env: "GH_TOKEN".to_string(),
+                headers: vec![("Authorization".to_string(), "Bearer $GH_TOKEN".to_string())],
+                hosts: vec!["github.com".to_string()],
+            }],
+            ports: vec!["6080".to_string()],
+            copies: vec![("pi".to_string(), "/home/user/.pi".to_string())],
+            env: vec![("TERM".to_string(), "xterm-256color".to_string())],
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exposures_list_hosts_with_credential_lines() {
+        let text = format_exposures(plain(), &exposure_fixture(false));
+        assert!(text.contains(
+            "config:\n  embedded defaults\n  ~/.config/wrap/config.yml\nnetwork-access: deny"
+        ));
+        assert!(text.contains(
+            "  github.com\n    GH_TOKEN: Authorization: Bearer $GH_TOKEN (guest does not see this token)"
+        ));
+        assert!(text.contains("  mise.run\n"));
+        assert!(!text.contains("no credential"));
+        assert!(text.contains("  deny: blocked.example.com, everything else"));
+        assert!(text.contains("ports: 6080"));
+        assert!(text.contains("copies: pi -> /home/user/.pi"));
+        assert!(text.contains("env: TERM=xterm-256color"));
+        assert!(!text.contains("(none)"));
+        assert!(
+            !text.contains("real-token"),
+            "secret values must never print"
+        );
+        assert!(
+            !text.contains("NOT-AN-ACTUAL-KEY"),
+            "stand-in value must never print"
+        );
+    }
+
+    #[test]
+    fn exposures_group_hosts_sharing_one_credential() {
+        let mut report = exposure_fixture(false);
+        report.allow = vec![
+            "github.com".to_string(),
+            "mise.run".to_string(),
+            "api.github.com".to_string(),
+        ];
+        report.secrets[0].hosts = vec!["github.com".to_string(), "api.github.com".to_string()];
+        let text = format_exposures(plain(), &report);
+        assert!(text.contains(
+            "  github.com, api.github.com\n    GH_TOKEN: Authorization: Bearer $GH_TOKEN"
+        ));
+        // The bare host between them still prints on its own line.
+        assert!(text.contains("  mise.run\n"));
+    }
+
+    #[test]
+    fn exposures_show_default_deny_without_a_list() {
+        let mut report = exposure_fixture(false);
+        report.deny.clear();
+        let text = format_exposures(plain(), &report);
+        assert!(text.contains("  deny: everything else"));
+        report.allow_everything = true;
+        let text = format_exposures(plain(), &report);
+        assert!(!text.contains("deny:"));
+    }
+
+    #[test]
+    fn exposures_flag_secrets_without_headers() {
+        let mut report = exposure_fixture(false);
+        report.secrets[0].headers.clear();
+        let text = format_exposures(plain(), &report);
+        assert!(text.contains("GH_TOKEN: no headers declared (guest does not see this token)"));
+    }
+
+    #[test]
+    fn exposures_paint_allow_red_and_deny_green() {
+        let denied = format_exposures(color(), &exposure_fixture(false));
+        assert!(
+            denied.contains("network-access: \x1b[38;2;129;199;132mdeny\x1b[0m"),
+            "default-deny reads green:\n{denied}"
+        );
+        let allowed = format_exposures(color(), &exposure_fixture(true));
+        assert!(
+            allowed.contains("network-access: \x1b[38;2;239;83;80mallow\x1b[0m"),
+            "allow-everything reads red:\n{allowed}"
+        );
+        // Colored output strips back to the plain text.
+        assert_eq!(
+            strip_ansi(&allowed),
+            format_exposures(plain(), &exposure_fixture(true))
+        );
+    }
+
+    #[test]
+    fn exposures_surface_fully_denied_secrets() {
+        let mut report = exposure_fixture(false);
+        report.allow.retain(|host| host != "github.com");
+        report.deny.push("github.com".to_string());
+        let text = format_exposures(plain(), &report);
+        assert!(text.contains("GH_TOKEN: no reachable hosts (all denied)"));
+    }
+
+    #[test]
+    fn exposures_omit_empty_ports_copies_and_group_bare_hosts() {
+        let mut report = exposure_fixture(false);
+        report.ports.clear();
+        report.copies.clear();
+        report.allow = vec![
+            "github.com".to_string(),
+            "mise.run".to_string(),
+            "pypi.org".to_string(),
+        ];
+        report.skipped = vec!["OPENAI_API_KEY".to_string()];
+        let text = format_exposures(plain(), &report);
+        assert!(!text.contains("ports:"));
+        assert!(!text.contains("copies:"));
+        assert!(text.contains("  mise.run, pypi.org\n"));
+        assert!(text.contains("skip: OPENAI_API_KEY"));
     }
 }
