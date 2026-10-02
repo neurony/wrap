@@ -656,11 +656,13 @@ fn mise_github_auth_snippet() -> String {
     let stand_in = config::SECRET_PLACEHOLDER;
     format!(
         "# Authenticate GitHub API clients (mise and friends) first: prefer a\n\
-         # real token from gh when it has one, else alias the injected\n\
+         # real token from gh when it is logged in, else alias the injected\n\
          # GH_TOKEN stand-in (substituted with the real value on matching\n\
-         # egress).\n\
+         # egress). Without hosts.yml gh can only echo GH_TOKEN back, so skip\n\
+         # it: its first start after boot is a slow cold read of the binary.\n\
          if [ -z \"${{GITHUB_TOKEN:-}}\" ]; then\n\
-         if command -v gh >/dev/null 2>&1; then\n\
+         if command -v gh >/dev/null 2>&1 \\\n\
+         && [ -s \"${{GH_CONFIG_DIR:-${{XDG_CONFIG_HOME:-$HOME/.config}}/gh}}/hosts.yml\" ]; then\n\
          _wrap_gh_token=\"$(gh auth token 2>/dev/null)\" || _wrap_gh_token=\"\"\n\
          case \"$_wrap_gh_token\" in\n\
          \"\"|\"{stand_in}\") ;;\n\
