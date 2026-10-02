@@ -738,36 +738,51 @@ async fn ensure_base_snapshot(
     Ok(base_snapshot)
 }
 
-/// Layer groups keep every capture. Drop the members a build superseded and
-/// the ungrouped layers older wraps captured. Sessions own copies of their
-/// layers, so only child snapshots pin a member: walk from the last layer
-/// down, and leave anything still pinned to a later build. Best effort; a
-/// failed removal never fails the build.
+/// Every build and every change to a layer script leaves a full chain of
+/// layer snapshots behind. Keep the current chain and the chains existing
+/// sessions were created from, with their ancestors, and drop every other
+/// wrap layer: superseded group members, chains of edited or removed layer
+/// scripts, and the ungrouped layers older wraps captured. A workspace whose
+/// session is gone rebuilds its chain on next entry.
+///
+/// Sessions hard-link the base disk of their layers, so removal never breaks
+/// one; only child snapshots pin a layer. Walk from the last layer down, and
+/// leave anything still pinned to a later build. Best effort; a failed
+/// removal never fails the build.
 async fn prune_layer_snapshots(stages: &[BuildStage]) {
     let Ok(snapshots) = Snapshot::list().await else {
         return;
     };
-    let mut heads = std::collections::HashMap::new();
+    let Some(mut keep) = session_base_digests().await else {
+        return;
+    };
     for stage in stages {
         if let Ok(head) = Snapshot::open(&stage.snapshot).await {
-            heads.insert(stage.snapshot.as_str(), head.digest().to_string());
+            keep.insert(head.digest().to_string());
         }
     }
-    let legacy_prefix = format!("{BASE_SNAPSHOT_PREFIX}-");
+    let parents: std::collections::HashMap<&str, &str> = snapshots
+        .iter()
+        .filter_map(|snapshot| Some((snapshot.digest(), snapshot.parent_digest()?)))
+        .collect();
+    let mut pending: Vec<String> = keep.iter().cloned().collect();
+    while let Some(digest) = pending.pop() {
+        if let Some(parent) = parents.get(digest.as_str())
+            && keep.insert(parent.to_string())
+        {
+            pending.push(parent.to_string());
+        }
+    }
+
+    let layer_prefix = format!("{BASE_SNAPSHOT_PREFIX}-");
     let mut stale: Vec<_> = snapshots
-        .into_iter()
+        .iter()
+        .filter(|snapshot| !keep.contains(snapshot.digest()))
         .filter_map(|snapshot| {
-            let layer = match snapshot.group() {
-                Some(group) => {
-                    let head = heads.get(group)?;
-                    (head != snapshot.digest()).then(|| group.to_string())?
-                }
-                None => snapshot
-                    .name()
-                    .filter(|name| name.starts_with(&legacy_prefix))?
-                    .to_string(),
-            };
-            Some((layer, snapshot))
+            let layer = snapshot.group().or(snapshot.name())?;
+            layer
+                .starts_with(&layer_prefix)
+                .then(|| (layer.to_string(), snapshot))
         })
         .collect();
     // Layer names carry a zero-padded index, so descending order removes
@@ -776,6 +791,44 @@ async fn prune_layer_snapshots(stages: &[BuildStage]) {
     for (_, snapshot) in stale {
         let _ = snapshot.remove(false).await;
     }
+}
+
+/// Base snapshot digests recorded in every session's base layout label, or
+/// `None` when the sessions cannot all be listed.
+async fn session_base_digests() -> Option<std::collections::HashSet<String>> {
+    let mut digests = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = Sandbox::list_with(|list| {
+            let list = list.limit(microsandbox::sandbox::MAX_SANDBOX_LIST_LIMIT);
+            match &cursor {
+                Some(cursor) => list.cursor(cursor),
+                None => list,
+            }
+        })
+        .await
+        .ok()?;
+        for sandbox in &page.sandboxes {
+            let config = sandbox.config().ok()?;
+            if let Some(layout) = config.spec.labels.get(BASE_LAYOUT_LABEL)
+                && let Some(digest) = base_layout_digest(layout)
+            {
+                digests.insert(digest.to_string());
+            }
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Some(digests),
+        }
+    }
+}
+
+/// The base snapshot digest in a `BASE_LAYOUT_LABEL` value
+/// (`name@digest`, optionally followed by `;`-separated fields).
+fn base_layout_digest(layout: &str) -> Option<&str> {
+    let (_, rest) = layout.split_once('@')?;
+    let digest = rest.split(';').next()?;
+    (!digest.is_empty()).then_some(digest)
 }
 
 /// Value recorded on each session as `BASE_LAYOUT_LABEL`.
@@ -2438,6 +2491,23 @@ mod tests {
         assert!(exports.contains("/opt/mise/data/shims"));
         assert!(exports.contains("$HOME/.local/bin"));
         assert!(!exports.contains("/root"));
+    }
+
+    #[test]
+    fn base_layout_digest_reads_the_base_snapshot_digest() {
+        assert_eq!(
+            base_layout_digest("wrap-image-04-dotfiles-ab@sha256:12;ports=6080;session=ff"),
+            Some("sha256:12")
+        );
+        assert_eq!(
+            base_layout_digest("wrap-image-04-dotfiles-ab@sha256:12"),
+            Some("sha256:12")
+        );
+        assert_eq!(
+            base_layout_digest("wrap-image-04-dotfiles-ab@;session=ff"),
+            None
+        );
+        assert_eq!(base_layout_digest("no-digest"), None);
     }
 
     #[test]
