@@ -719,6 +719,7 @@ async fn ensure_base_snapshot(
     }
 
     let mut parent: Option<String> = None;
+    let mut built = false;
     for stage in &stages {
         if !rebuild && Snapshot::open(&stage.snapshot).await.is_ok() {
             ui.layer_reused(&stage.id);
@@ -727,8 +728,52 @@ async fn ensure_base_snapshot(
         }
         build_layer(ui, cfg, stage, parent.as_deref(), secrets).await?;
         parent = Some(stage.snapshot.clone());
+        built = true;
+    }
+    if built {
+        prune_layer_snapshots(&stages).await;
     }
     Ok(base_snapshot)
+}
+
+/// Layer groups keep every capture. Drop the members a build superseded and
+/// the ungrouped layers older wraps captured. Sessions own copies of their
+/// layers, so only child snapshots pin a member: walk from the last layer
+/// down, and leave anything still pinned to a later build. Best effort; a
+/// failed removal never fails the build.
+async fn prune_layer_snapshots(stages: &[BuildStage]) {
+    let Ok(snapshots) = Snapshot::list().await else {
+        return;
+    };
+    let mut heads = std::collections::HashMap::new();
+    for stage in stages {
+        if let Ok(head) = Snapshot::open(&stage.snapshot).await {
+            heads.insert(stage.snapshot.as_str(), head.digest().to_string());
+        }
+    }
+    let legacy_prefix = format!("{BASE_SNAPSHOT_PREFIX}-");
+    let mut stale: Vec<_> = snapshots
+        .into_iter()
+        .filter_map(|snapshot| {
+            let layer = match snapshot.group() {
+                Some(group) => {
+                    let head = heads.get(group)?;
+                    (head != snapshot.digest()).then(|| group.to_string())?
+                }
+                None => snapshot
+                    .name()
+                    .filter(|name| name.starts_with(&legacy_prefix))?
+                    .to_string(),
+            };
+            Some((layer, snapshot))
+        })
+        .collect();
+    // Layer names carry a zero-padded index, so descending order removes
+    // children before their parents.
+    stale.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, snapshot) in stale {
+        let _ = snapshot.remove(false).await;
+    }
 }
 
 /// Value recorded on each session as `BASE_LAYOUT_LABEL`.
