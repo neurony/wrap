@@ -242,7 +242,7 @@ pub struct SecretSpec {
     /// Values reference guest env vars holding [`SECRET_PLACEHOLDER`], which
     /// microsandbox substitutes on matching traffic. A secret with entries
     /// here gets header injection; a declared `Authorization` header covering
-    /// github.com additionally doubles as git's http.extraheader.
+    /// github.com additionally makes git authenticate with this secret.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Host → `{allow: true}`. Allowed hosts of live secrets fold into the
