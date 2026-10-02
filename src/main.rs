@@ -31,6 +31,7 @@ use ui::{CrossingKind, Live, Ui};
 /// caches, dotfiles, and host-copies outside the project.
 pub(crate) const WORKSPACE: &str = "/home/user/workspace";
 const BASE_SNAPSHOT_PREFIX: &str = "wrap-image";
+const SNAPSHOT_LAYOUT: &str = "groups-v1";
 const BASE_LAYOUT_LABEL: &str = "wrap.base-layout";
 const SECRET_VALUES_LABEL: &str = "wrap.secret-values";
 const SESSION_MEMORY_MIN_MIB: u32 = 4096;
@@ -236,6 +237,8 @@ async fn run() -> Result<u8> {
         return run_log(&cwd, explicit.as_deref(), *tail, *follow).await;
     }
 
+    ensure_runtime().await?;
+
     if let Some(method) = fast_method(cli.rebuild, cli.reset, &cli.command) {
         let sandbox = connect_existing(&cwd).await?;
         return methods::run_method(&sandbox, method).await;
@@ -295,6 +298,38 @@ async fn run() -> Result<u8> {
         ui.stop_failed(&err);
     }
     Ok(code)
+}
+
+/// microsandbox no longer installs a missing runtime on first use, and it
+/// runs whatever complete msb/libkrunfw pair it finds, even one from another
+/// release. Keep the home runtime on exactly the release this binary links.
+async fn ensure_runtime() -> Result<()> {
+    use microsandbox::setup::{
+        InstallOptions, install_runtime, resolve_runtime, resolve_runtime_version,
+    };
+    let config = microsandbox::config::config().context("load microsandbox config")?;
+    let wanted = InstallOptions::default();
+    let current = match resolve_runtime(&config) {
+        Ok(runtime) => resolve_runtime_version(&runtime.msb_path)
+            .context("read microsandbox runtime version")?
+            .map(|version| version.to_string()),
+        Err(microsandbox::MicrosandboxError::RuntimeNotInstalled(_)) => None,
+        Err(err) => return Err(err).context("resolve microsandbox runtime"),
+    };
+    if current.as_deref() == Some(wanted.version.as_str()) {
+        return Ok(());
+    }
+    let version = wanted.version.clone();
+    install_runtime(
+        &config,
+        InstallOptions {
+            force: true,
+            ..wanted
+        },
+    )
+    .await
+    .with_context(|| format!("install microsandbox runtime {version}"))?;
+    Ok(())
 }
 
 async fn connect_existing(cwd: &Path) -> Result<Sandbox> {
@@ -521,6 +556,9 @@ fn build_stages(cfg: &config::Config) -> Result<Vec<BuildStage>> {
     );
 
     let mut lineage = Sha256::new();
+    // Layers are snapshot groups since microsandbox 0.7; never resolve a
+    // name to an ungrouped snapshot captured by an older wrap.
+    lineage.update(SNAPSHOT_LAYOUT.as_bytes());
     lineage.update(cfg.sandbox.image.as_bytes());
     Ok(definitions
         .into_iter()
@@ -544,6 +582,14 @@ fn build_stages(cfg: &config::Config) -> Result<Vec<BuildStage>> {
             }
         })
         .collect())
+}
+
+fn layer_member_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("build-{nanos}")
 }
 
 fn mise_agents_script(agents: &[config::AgentSpec]) -> Result<String> {
@@ -665,9 +711,10 @@ async fn ensure_base_snapshot(
 
     ui.setting_up_base();
     if rebuild {
-        // SnapshotBuilder::force stages a complete replacement before promotion. Keep the
-        // current chain available so an interrupted rebuild cannot turn the
-        // next workspace into an accidental full builder.
+        // Each layer is a snapshot group and a rebuild captures a new member,
+        // moving the head only once the capture succeeds. The current chain
+        // stays available, so an interrupted rebuild cannot turn the next
+        // workspace into an accidental full builder.
         ui.rebuild(stages.len());
     }
 
@@ -757,7 +804,7 @@ async fn rotate_changed_secrets(
                 .value(value)
                 .placeholder(config::SECRET_PLACEHOLDER);
             for host in &hosts {
-                patch = patch.allow_host(host.clone());
+                patch = patch.allow(host.clone());
             }
             patch
         });
@@ -771,6 +818,7 @@ async fn rotate_changed_secrets(
 
 fn session_config_digest(cfg: &config::Config, secrets: &config::ResolvedSecrets) -> String {
     let mut digest = Sha256::new();
+    digest.update(b"tls-intercept\0");
     let mut field = |tag: &str, values: &[String]| {
         digest.update(tag.as_bytes());
         digest.update([0]);
@@ -850,7 +898,7 @@ async fn build_layer(
         .replace()
         .network(|n| n.policy(NetworkPolicy::from_profiles([NetworkProfile::Public])));
     builder = if let Some(snapshot) = parent {
-        builder.from_snapshot(snapshot)
+        builder.override_snapshot(snapshot)
     } else {
         // The image stage only runs on first build or --rebuild; both want the
         // registry's current `latest`, not a stale local tag. Always re-checks
@@ -911,12 +959,20 @@ async fn build_layer(
 
     live.phase("saving shared snapshot")?;
     if let Err(err) = wait_with_live(&mut live, async {
-        Snapshot::builder(&stage.snapshot)
+        // Group members are immutable, so every capture gets a fresh member
+        // name. A rebuilt layer does not descend from the previous head, so
+        // select it explicitly; sessions resolve the group to its head.
+        let member = layer_member_name();
+        Snapshot::builder(&member)
             .from_sandbox(&sandbox_name)
-            .force()
+            .group(&stage.snapshot)
             .create()
             .await
-            .with_context(|| format!("snapshot layer {}", stage.id))
+            .with_context(|| format!("snapshot layer {}", stage.id))?;
+        Snapshot::group_head(&format!("{}:{member}", stage.snapshot))
+            .await
+            .with_context(|| format!("select layer {} head", stage.id))
+            .map(drop)
     })
     .await
     {
@@ -1452,8 +1508,8 @@ async fn enforce_session_resources(
         .modify()
         .cpus(desired.cpus)
         .max_cpus(desired.cpus)
-        .memory_mib(desired.memory)
-        .max_memory_mib(desired.memory_max)
+        .memory(desired.memory)
+        .max_memory(desired.memory_max)
         .restart()
         .apply()
         .await
@@ -1520,7 +1576,7 @@ async fn create_session(
     let user = guest_user(identity);
 
     let mut builder = Sandbox::builder(name)
-        .from_snapshot(base_snapshot)
+        .override_snapshot(base_snapshot)
         // Debug runtime diagnostics persist the network policy denials
         // (`wrap log` reads them); without this only info and above reach
         // the session logs.
@@ -1547,7 +1603,10 @@ async fn create_session(
             v.bind(cwd.to_path_buf())
                 .stat_virtualization(StatVirtualization::Off)
         })
-        .network(|n| n.policy(policy));
+        // Strict hostname rules (microsandbox 0.7.3+) admit an HTTPS allow
+        // rule only once the request's host is checked against its SNI, which
+        // needs TLS interception; secret substitution needs it too.
+        .network(|n| n.policy(policy).tls(|t| t));
     let localtime = Path::new("/etc/localtime");
     if localtime.exists() {
         builder = builder.volume("/etc/localtime", |v| v.bind(localtime).readonly());
@@ -1626,7 +1685,6 @@ fn apply_secrets(
     for secret in &secrets.found {
         let env = secret.env.clone();
         let value = secret.value.clone();
-        let headers = secret.headers.clone();
         let hosts = secret.hosts.clone();
         builder = builder.secret(|mut s| {
             // The guest env var holds the constant stand-in; microsandbox
@@ -1636,19 +1694,13 @@ fn apply_secrets(
                 .value(value)
                 .placeholder(config::SECRET_PLACEHOLDER);
             for host in &hosts {
-                s = if host.contains('*') {
-                    s.allow_host_pattern(host)
-                } else {
-                    s.allow_host(host)
-                };
+                s = s.allow(host);
             }
-            if !headers.is_empty() {
-                // Declared headers ride header injection as placeholder
-                // substitution; per-tool config (e.g. git's http.extraheader,
-                // written at session entry) makes guest tools send them.
-                s = s.inject_headers(true);
-            }
-            s
+            // Declared headers ride header substitution of the placeholder;
+            // per-tool config (e.g. git's http.extraheader, written at session
+            // entry) makes guest tools send them. Headers are the only location
+            // enabled, and a secret needs at least one.
+            s.substitute_in_headers(true)
         });
     }
     builder
