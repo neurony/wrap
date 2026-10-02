@@ -1797,9 +1797,9 @@ fn apply_secrets(
                 s = s.allow(host);
             }
             // Declared headers ride header substitution of the placeholder;
-            // per-tool config (e.g. git's http.extraheader, written at session
-            // entry) makes guest tools send them. Headers are the only location
-            // enabled, and a secret needs at least one.
+            // per-tool config (e.g. git's credential helper, written at session
+            // entry) makes guest tools send them, Basic credentials included.
+            // Headers are the only location enabled, and a secret needs one.
             s.substitute_in_headers(true)
         });
     }
@@ -1867,13 +1867,9 @@ async fn enter_session(
     secrets: &config::ResolvedSecrets,
     command: &[String],
 ) -> Result<u8> {
-    if secrets_need_git_header(command, secrets) {
-        if let Some((name, value)) = github_extraheader(secrets) {
-            let _ = sandbox
-                .shell(format!(
-                    "git config --global http.https://github.com/.extraheader \"{name}: {value}\""
-                ))
-                .await;
+    if secrets_need_git_credentials(command, secrets) {
+        if let Some(env) = github_git_secret_env(secrets) {
+            let _ = sandbox.shell(git_credential_setup(env)).await;
         }
     }
 
@@ -1933,26 +1929,50 @@ fn guest_command(cfg: &config::Config, command: &[String]) -> (String, Vec<Strin
     )
 }
 
-/// The first live secret declaring an `Authorization` header for exactly
-/// `github.com` provides git's http.extraheader (header name and value
-/// template). The value references a guest env var, so the shell expands it
-/// to the stand-in at entry time and header injection substitutes the real
-/// token on the wire.
-fn github_extraheader(secrets: &config::ResolvedSecrets) -> Option<(String, String)> {
-    secrets.found.iter().find_map(|secret| {
-        if !secret.hosts.iter().any(|host| host == "github.com") {
-            return None;
-        }
-        secret
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            .map(|(name, value)| (name.clone(), value.clone()))
-    })
+/// The guest env var of the first live secret that declares an
+/// `Authorization` header for exactly `github.com`; git authenticates with
+/// it. Names that are not shell identifiers are skipped, since the
+/// credential helper expands the variable.
+fn github_git_secret_env(secrets: &config::ResolvedSecrets) -> Option<&str> {
+    secrets
+        .found
+        .iter()
+        .find(|secret| {
+            secret.hosts.iter().any(|host| host == "github.com")
+                && secret
+                    .headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+        })
+        .map(|secret| secret.env.as_str())
+        .filter(|env| is_shell_identifier(env))
 }
 
-fn secrets_need_git_header(command: &[String], secrets: &config::ResolvedSecrets) -> bool {
-    command.first().is_none_or(|cmd| cmd != "true") && github_extraheader(secrets).is_some()
+fn is_shell_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// GitHub's git endpoint accepts a token only as the Basic password, and an
+/// `Authorization: Bearer` header fails even anonymous fetches of public
+/// repositories. A credential helper answers git's challenge with
+/// `x-access-token` and the stand-in, which substitution replaces inside the
+/// Basic credentials on matching egress; public fetches stay anonymous.
+/// Removes the extraheader that older wraps wrote.
+fn git_credential_setup(env: &str) -> String {
+    format!(
+        "git config --global --unset-all http.https://github.com/.extraheader; \
+         git config --global --replace-all credential.https://github.com.helper ''; \
+         git config --global --add credential.https://github.com.helper \
+         '!f() {{ test \"$1\" = get && printf \"username=x-access-token\\npassword=%s\\n\" \"${env}\"; }}; f'"
+    )
+}
+
+fn secrets_need_git_credentials(command: &[String], secrets: &config::ResolvedSecrets) -> bool {
+    command.first().is_none_or(|cmd| cmd != "true") && github_git_secret_env(secrets).is_some()
 }
 
 fn sandbox_name(cwd: &Path) -> Result<String> {
@@ -2270,38 +2290,94 @@ mod tests {
     }
 
     #[test]
-    fn git_extraheader_comes_from_declared_authorization() {
+    fn git_credentials_come_from_declared_authorization() {
         let live = resolved(&[(
             "GH_TOKEN",
             &[("Authorization", "Bearer $GH_TOKEN")],
             &["github.com"],
         )]);
-        assert!(secrets_need_git_header(&[], &live));
-        assert_eq!(
-            github_extraheader(&live),
-            Some(("Authorization".to_string(), "Bearer $GH_TOKEN".to_string()))
-        );
-        assert!(!secrets_need_git_header(&["true".to_string()], &live));
+        assert!(secrets_need_git_credentials(&[], &live));
+        assert_eq!(github_git_secret_env(&live), Some("GH_TOKEN"));
+        assert!(!secrets_need_git_credentials(&["true".to_string()], &live));
         // No secrets, no Authorization header, or no github.com host.
-        assert!(!secrets_need_git_header(&[], &resolved(&[])));
+        assert!(!secrets_need_git_credentials(&[], &resolved(&[])));
         let no_header = resolved(&[("GH_TOKEN", &[], &["github.com"])]);
-        assert!(!secrets_need_git_header(&[], &no_header));
+        assert!(!secrets_need_git_credentials(&[], &no_header));
         let elsewhere = resolved(&[(
             "OTHER",
             &[("Authorization", "Bearer $OTHER")],
             &["api.example.com"],
         )]);
-        assert!(!secrets_need_git_header(&[], &elsewhere));
+        assert!(!secrets_need_git_credentials(&[], &elsewhere));
         // Header name matching is case-insensitive; first match wins.
         let lower = resolved(&[(
             "GH_TOKEN",
             &[("authorization", "Bearer $GH_TOKEN")],
             &["github.com"],
         )]);
-        assert_eq!(
-            github_extraheader(&lower),
-            Some(("authorization".to_string(), "Bearer $GH_TOKEN".to_string()))
-        );
+        assert_eq!(github_git_secret_env(&lower), Some("GH_TOKEN"));
+        // The helper expands the variable, so it must be a shell identifier.
+        let odd = resolved(&[(
+            "GH-TOKEN",
+            &[("Authorization", "Bearer $GH-TOKEN")],
+            &["github.com"],
+        )]);
+        assert_eq!(github_git_secret_env(&odd), None);
+    }
+
+    #[test]
+    fn git_credential_setup_answers_github_with_the_stand_in() {
+        let home = std::env::temp_dir().join(format!("wrap-git-cred-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .env("HOME", &home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("TOKEN_UNDER_TEST", "stand-in")
+                .output()
+                .unwrap()
+        };
+        git(&[
+            "config",
+            "--global",
+            "http.https://github.com/.extraheader",
+            "Authorization: Bearer old",
+        ]);
+        let setup = std::process::Command::new("sh")
+            .args(["-c", &git_credential_setup("TOKEN_UNDER_TEST")])
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(setup.success());
+        let extraheader = git(&[
+            "config",
+            "--global",
+            "--get-all",
+            "http.https://github.com/.extraheader",
+        ]);
+        assert!(extraheader.stdout.is_empty(), "old extraheader removed");
+        let mut fill = std::process::Command::new("git")
+            .args(["credential", "fill"])
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("TOKEN_UNDER_TEST", "stand-in")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        fill.stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .unwrap();
+        let filled = String::from_utf8(fill.wait_with_output().unwrap().stdout).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(filled.contains("username=x-access-token\n"), "{filled}");
+        assert!(filled.contains("password=stand-in\n"), "{filled}");
     }
 
     #[test]

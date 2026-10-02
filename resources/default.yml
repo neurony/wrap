@@ -42,8 +42,8 @@ env:
 #             name → value (e.g. `Authorization: "Bearer $GH_TOKEN"`,
 #             `X-Api-Key: $ANTHROPIC_API_KEY`). A secret with entries here
 #             gets header injection; a declared `Authorization` header
-#             covering github.com additionally doubles as git's
-#             http.extraheader.
+#             covering github.com additionally makes git authenticate
+#             with this secret (as the Basic password).
 # - hosts:    map of host → `{allow: true}`. Only the allowed hosts of live
 #             (resolved) secrets fold into the network allowlist; a skipped
 #             secret whitelists nothing and `network.deny` still wins.
